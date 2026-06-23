@@ -1343,12 +1343,14 @@ function Root() {
     return () => { cancelled = true; };
   }, [farm?.id, farm?.lat, farm?.lng, earliestPlantingDate]);
 
-  // ---- 개폐기 자동화: 1분마다 + 날씨 변경 시 조건 재계산 ----
+  // ---- 개폐기 자동화: 1분마다 + 날씨 변경 + 설정 변경 시 즉시 재계산 ----
   const [ventTick, setVentTick] = useState(0);
   useEffect(() => {
     const t = setInterval(() => setVentTick((n) => n + 1), 60000);
     return () => clearInterval(t);
   }, []);
+  // 자동 켜진 하우스 수 — 설정 변경 즉시 effect 재실행 트리거
+  const enabledAutoCount = Object.values(state.ventAutoConfigs || {}).filter((c) => c?.enabled).length;
   useEffect(() => {
     if (!farm) return;
     const s = stateRef.current;
@@ -1365,7 +1367,7 @@ function Root() {
     if (Object.keys(updates).length > 0) {
       update((s) => ({ ...s, houseState: { ...s.houseState, ...updates } }));
     }
-  }, [ventTick, weather.cur, weather.rainProb, farm?.id]);
+  }, [ventTick, weather.cur, weather.rainProb, weather.rain, farm?.id, enabledAutoCount]);
 
   // ---- 라우팅 ----
   const [tab, setTab] = useState("today");
@@ -2065,10 +2067,11 @@ function Note() {
 
 /* ============================ 개폐기 자동화 =========================== */
 // 우선순위: 비 → 시간 범위 → 온도 → 기본 열기
+// 비 판정: 실제 강수량 > 0  OR  강수확률 70% 이상 (습도와 무관)
 function computeAutoVentState(cfg, weather) {
   if (!cfg?.enabled) return null;
-  const rainProb = weather?.rainProb ?? 0;
-  if (cfg.rainClose && rainProb >= 50) return "closed";
+  const isRaining = (weather?.rain ?? 0) > 0 || (weather?.rainProb ?? 0) >= 70;
+  if (cfg.rainClose && isRaining) return "closed";
   const now = new Date();
   const hourNow = now.getHours() + now.getMinutes() / 60;
   if (hourNow < cfg.openHour || hourNow >= cfg.closeHour) return "closed";
@@ -2226,8 +2229,10 @@ function QuickScreen({ state, update, farm, showToast, setDetailHouseId, weather
     if (btn.key === "pest") return setPestModal({ houses: [...sel] });
     if (btn.key === "memo") return setMemoModal({ houses: [...sel] });
     if (btn.key === "photo") {
-      if (sel.length !== 1) return showToast("사진 기록은 하우스 1개만 선택하세요");
-      return setPhotoModal({ houseId: sel[0] });
+      const photoHouseId = sel[sel.length - 1];
+      if (!photoHouseId) return showToast("하우스를 먼저 선택하세요");
+      if (sel.length > 1) showToast(`가장 최근 선택 하우스로 사진을 기록합니다`);
+      return setPhotoModal({ houseId: photoHouseId });
     }
 
     const ts = Date.now();
@@ -4325,10 +4330,17 @@ function HouseDetail({ state, update, farm, user, houseId, onBack, showToast, we
         {(() => {
           const DEFAULT_VENT_CFG = { enabled: false, openTemp: 23, closeTemp: 10, openHour: 8, closeHour: 20, rainClose: true };
           const ventCfg = { ...DEFAULT_VENT_CFG, ...((state.ventAutoConfigs || {})[houseId] || {}) };
-          const updateVentCfg = (patch) => update((s) => ({
-            ...s,
-            ventAutoConfigs: { ...(s.ventAutoConfigs || {}), [houseId]: { ...ventCfg, ...patch } },
-          }));
+          const updateVentCfg = (patch) => update((s) => {
+            const newCfg = { ...ventCfg, ...patch };
+            const newConfigs = { ...(s.ventAutoConfigs || {}), [houseId]: newCfg };
+            if (newCfg.enabled) {
+              const autoState = computeAutoVentState(newCfg, weather);
+              if (autoState) {
+                return { ...s, ventAutoConfigs: newConfigs, houseState: { ...s.houseState, [houseId]: { ...(s.houseState[houseId] || {}), vent: autoState, updatedAt: Date.now() } } };
+              }
+            }
+            return { ...s, ventAutoConfigs: newConfigs };
+          });
           const autoResult = computeAutoVentState(ventCfg, weather);
           return (
             <Card style={{ marginBottom: 10 }}>
@@ -4349,8 +4361,8 @@ function HouseDetail({ state, update, farm, user, houseId, onBack, showToast, we
                   <div style={{ background: T.panel2, borderRadius: 10, padding: "10px 12px", marginBottom: 12 }}>
                     <div style={{ fontSize: 12.5, color: T.accent, fontWeight: 800, marginBottom: 4 }}>현재 자동 계산 결과</div>
                     <div style={{ fontSize: 16, fontWeight: 800 }}>{autoResult === "open" ? "열림 ▲" : "닫힘 ▼"}</div>
-                    {ventCfg.rainClose && weather.rainProb >= 50 && (
-                      <div style={{ color: T.caution, fontSize: 12.5, marginTop: 4 }}>강수확률 {weather.rainProb}% → 비 우선 닫힘</div>
+                    {ventCfg.rainClose && ((weather.rain ?? 0) > 0 || weather.rainProb >= 70) && (
+                      <div style={{ color: T.caution, fontSize: 12.5, marginTop: 4 }}>{(weather.rain ?? 0) > 0 ? `실제 강수 ${weather.rain}mm` : `강수확률 ${weather.rainProb}%`} → 비 우선 닫힘</div>
                     )}
                   </div>
                   <div style={{ fontSize: 13, fontWeight: 800, color: T.ok, marginBottom: 6 }}>여는 조건</div>
@@ -4379,7 +4391,7 @@ function HouseDetail({ state, update, farm, user, houseId, onBack, showToast, we
                     <input type="checkbox" checked={ventCfg.rainClose}
                       onChange={(ev) => updateVentCfg({ rainClose: ev.target.checked })}
                       style={{ width: 20, height: 20 }} />
-                    <span style={{ fontSize: 14, color: T.ink }}>비 올 때 닫기 (강수확률 50% 이상)</span>
+                    <span style={{ fontSize: 14, color: T.ink }}>비 올 때 닫기 (실제 강수 또는 강수확률 70% 이상)</span>
                   </label>
                   <div style={{ background: T.accent + "11", borderRadius: 9, padding: "10px 12px", fontSize: 12.5, color: T.sub, lineHeight: 1.65 }}>
                     우선순위: 비 → 시간 범위 → 온도 순으로 적용됩니다.<br />
