@@ -1447,15 +1447,15 @@ function AuthScreen({ state, update, showToast }) {
   });
   const set = (k) => (e) => setForm((f) => ({ ...f, [k]: e.target.value }));
 
+  const normLogin = (s) => (s || "").trim().toLowerCase();
   const doSignup = async () => {
     if (!form.name || !form.login || !form.pwd) return showToast("이름·아이디·비밀번호를 입력하세요");
-    const loginKey = form.login.trim().toLowerCase().replace(/\//g, "-");
-    // 중복 확인: 클라우드 우선, 없으면 로컬
+    const loginKey = normLogin(form.login).replace(/\//g, "-");
+    // 중복 확인: 로컬 + 클라우드 양쪽 모두
+    if (state.users.some((u) => normLogin(u.login) === loginKey)) return showToast("이미 있는 아이디입니다");
     if (sync.isConfigured()) {
       const existing = await sync.fetchUser(loginKey);
       if (existing) return showToast("이미 사용 중인 아이디입니다");
-    } else if (state.users.some((u) => u.login === form.login.trim())) {
-      return showToast("이미 있는 아이디입니다");
     }
     const userId = uid();
     const farmId = uid();
@@ -1491,16 +1491,16 @@ function AuthScreen({ state, update, showToast }) {
   const [loggingIn, setLoggingIn] = useState(false);
   const doLogin = async () => {
     if (loggingIn) return;
-    let u = state.users.find((x) => x.login === form.login.trim());
+    const loginNorm = normLogin(form.login).replace(/\//g, "-");
+    let u = state.users.find((x) => normLogin(x.login).replace(/\//g, "-") === loginNorm);
     let fromCloud = false;
     let farmSyncCode = null;
 
-    // 로컬에 없으면 클라우드에서 조회
-    const loginKey = form.login.trim().toLowerCase().replace(/\//g, "-");
+    // 로컬에 없으면 클라우드에서 조회 (loginNorm = loginKey)
     if (!u && sync.isConfigured()) {
       setLoggingIn(true);
       showToast("계정 확인 중…");
-      const cloudUser = await sync.fetchUser(loginKey);
+      const cloudUser = await sync.fetchUser(loginNorm);
       setLoggingIn(false);
       if (cloudUser) {
         u = { id: cloudUser.id, name: cloudUser.name, login: cloudUser.login, pwd: cloudUser.pwdHash };
@@ -1517,10 +1517,10 @@ function AuthScreen({ state, update, showToast }) {
 
     // 로컬 로그인 성공 시 클라우드에 없으면 저장 (기존 가입자 자동 마이그레이션)
     if (!fromCloud && sync.isConfigured()) {
-      sync.fetchUser(loginKey).then(async (existing) => {
+      sync.fetchUser(loginNorm).then(async (existing) => {
         if (!existing) {
           const myFarmForCloud = state.farms.find((f) => f.ownerId === u.id);
-          await sync.saveUser(loginKey, {
+          await sync.saveUser(loginNorm, {
             id: u.id, name: u.name, login: u.login, pwdHash: u.pwd,
             farmSyncCode: myFarmForCloud?.syncCode || null, createdAt: localISODate(),
           });
