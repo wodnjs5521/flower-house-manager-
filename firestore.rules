@@ -34,6 +34,19 @@ service cloud.firestore {
         && request.resource.data.updatedAt is int;
     }
 
+    // 사용자 계정 (크로스 디바이스 로그인)
+    match /fhm_users/{loginKey} {
+      // 로그인 조회는 누구나 허용 (아이디+비번 세트 없으면 로그인 불가)
+      allow read: if true;
+      // 최초 가입 시 1회 생성만 허용. 필수 필드 + pwdHash 포맷 검증
+      allow create: if request.resource.data.keys().hasAll(['id','name','login','pwdHash','createdAt','farmSyncCode'])
+                    && request.resource.data.pwdHash is string
+                    && request.resource.data.pwdHash.matches('^fhm1\\$[pf]\\$.*')
+                    && request.resource.data.login.size() < 200;
+      // 수정·삭제 금지 (비밀번호 변경 기능 추가 시 별도 처리)
+      allow update, delete: if false;
+    }
+
     // 그 외 모든 경로는 차단
     match /{document=**} {
       allow read, write: if false;

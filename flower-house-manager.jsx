@@ -1136,6 +1136,22 @@ const sync = {
   stop() {
     if (this.unsub) { this.unsub(); this.unsub = null; }
   },
+  async saveUser(loginKey, userDoc) {
+    if (!this.init()) return false;
+    try {
+      const { doc, setDoc } = window.firebaseApi;
+      await setDoc(doc(this.db, "fhm_users", loginKey), userDoc);
+      return true;
+    } catch (e) { return false; }
+  },
+  async fetchUser(loginKey) {
+    if (!this.init()) return null;
+    try {
+      const { doc, getDoc } = window.firebaseApi;
+      const snap = await getDoc(doc(this.db, "fhm_users", loginKey));
+      return snap.exists() ? snap.data() : null;
+    } catch (e) { return null; }
+  },
 };
 
 export default function App() {
@@ -1384,32 +1400,33 @@ function AuthScreen({ state, update, showToast }) {
 
   const doSignup = async () => {
     if (!form.name || !form.login || !form.pwd) return showToast("이름·아이디·비밀번호를 입력하세요");
-    if (state.users.some((u) => u.login === form.login)) return showToast("이미 있는 아이디입니다");
+    const loginKey = form.login.trim().toLowerCase().replace(/\//g, "-");
+    if (sync.isConfigured()) {
+      const existing = await sync.fetchUser(loginKey);
+      if (existing) return showToast("이미 사용 중인 아이디입니다");
+    } else if (state.users.some((u) => u.login === form.login.trim())) {
+      return showToast("이미 있는 아이디입니다");
+    }
     const userId = uid();
     const farmId = uid();
     const autoCode = "FARM-" + Math.random().toString(36).slice(2, 7).toUpperCase();
     const pwdHash = await hashPwd(form.pwd);
     const n = Math.max(0, Math.min(60, parseInt(form.houses) || 0));
     const houses = Array.from({ length: n }, (_, i) => ({
-      id: uid(),
-      farmId,
-      number: i + 1,
-      name: `${i + 1}동`,
-      flower: "",
-      variety: "",
-      color: "",
-      plantingDate: "",
-      seedlingDate: "",
-      expectedTotal: "",
-      unit: "송이",
-      lat: null,
-      lng: null,
-      qr: `FHM-${i + 1}`,
-      memo: "",
+      id: uid(), farmId, number: i + 1, name: `${i + 1}동`,
+      flower: "", variety: "", color: "", plantingDate: "", seedlingDate: "",
+      expectedTotal: "", unit: "송이", lat: null, lng: null, qr: `FHM-${i + 1}`, memo: "",
     }));
+    if (sync.isConfigured()) {
+      const saved = await sync.saveUser(loginKey, {
+        id: userId, name: form.name.trim(), login: form.login.trim(),
+        pwdHash, farmSyncCode: autoCode, createdAt: localISODate(),
+      });
+      if (!saved) showToast("계정 저장 실패 — 이 기기에만 저장됩니다");
+    }
     update((s) => ({
       ...s,
-      users: [...s.users, { id: userId, name: form.name, login: form.login, pwd: pwdHash }],
+      users: [...s.users, { id: userId, name: form.name.trim(), login: form.login.trim(), pwd: pwdHash }],
       session: userId,
       farms: form.farmName
         ? [...s.farms, { id: farmId, ownerId: userId, name: form.farmName, region: form.region, lat: null, lng: null, memo: "", syncCode: autoCode, joinPassword: pwdHash }]
@@ -1417,22 +1434,69 @@ function AuthScreen({ state, update, showToast }) {
       activeFarmId: form.farmName ? farmId : null,
       houses: form.farmName ? [...s.houses, ...houses] : s.houses,
     }));
-    showToast(`환영합니다, ${form.name}님`);
+    showToast(`환영합니다, ${form.name.trim()}님`);
   };
 
+  const [loggingIn, setLoggingIn] = useState(false);
   const doLogin = async () => {
-    const u = state.users.find((x) => x.login === form.login);
+    if (loggingIn) return;
+    let u = state.users.find((x) => x.login === form.login.trim());
+    let fromCloud = false;
+    let farmSyncCode = null;
+
+    if (!u && sync.isConfigured()) {
+      setLoggingIn(true);
+      showToast("계정 확인 중…");
+      const loginKey = form.login.trim().toLowerCase().replace(/\//g, "-");
+      const cloudUser = await sync.fetchUser(loginKey);
+      setLoggingIn(false);
+      if (cloudUser) {
+        u = { id: cloudUser.id, name: cloudUser.name, login: cloudUser.login, pwd: cloudUser.pwdHash };
+        farmSyncCode = cloudUser.farmSyncCode || null;
+        fromCloud = true;
+      }
+    }
+
     if (!u || !(await verifyPwd(form.pwd, u.pwd))) return showToast("아이디 또는 비밀번호가 맞지 않습니다");
+
+    let farmPayload = null;
+    if (fromCloud && farmSyncCode && sync.isConfigured()) {
+      farmPayload = await sync.fetchByCode(farmSyncCode);
+    }
+
     const myFarm = state.farms.find((f) => f.ownerId === u.id);
-    // 기존 평문 비밀번호면 로그인 성공 시 해시로 자동 업그레이드 (본인 소유 농장 참여 비밀번호 포함)
     const upgrade = isHashedPwd(u.pwd) ? null : await hashPwd(form.pwd);
-    update((s) => ({
-      ...s,
-      session: u.id,
-      activeFarmId: myFarm?.id || null,
-      users: upgrade ? s.users.map((x) => (x.id === u.id ? { ...x, pwd: upgrade } : x)) : s.users,
-      farms: upgrade ? s.farms.map((f) => (f.ownerId === u.id && f.joinPassword === form.pwd ? { ...f, joinPassword: upgrade } : f)) : s.farms,
-    }));
+    const activeFarmId = farmPayload?.farm?.id || myFarm?.id || null;
+
+    update((s) => {
+      const inState = s.users.some((x) => x.id === u.id);
+      let next = {
+        ...s,
+        session: u.id,
+        activeFarmId,
+        users: inState
+          ? (upgrade ? s.users.map((x) => (x.id === u.id ? { ...x, pwd: upgrade } : x)) : s.users)
+          : [...s.users, u],
+        farms: upgrade ? s.farms.map((f) => (f.ownerId === u.id && f.joinPassword === form.pwd ? { ...f, joinPassword: upgrade } : f)) : s.farms,
+      };
+      if (farmPayload?.farm) {
+        const farmId = farmPayload.farm.id;
+        const remap = (arr) => (arr || []).map((x) => ({ ...x, farmId }));
+        next = {
+          ...next,
+          farms: next.farms.some((f) => f.id === farmId)
+            ? next.farms
+            : [...next.farms, { ...farmPayload.farm, syncCode: farmSyncCode }],
+          houses: [...next.houses.filter((h) => h.farmId !== farmId), ...remap(farmPayload.houses || [])],
+          workLogs: [...next.workLogs.filter((w) => w.farmId !== farmId), ...remap(farmPayload.workLogs || [])],
+          harvestLogs: [...next.harvestLogs.filter((h) => h.farmId !== farmId), ...remap(farmPayload.harvestLogs || [])],
+          shipments: [...next.shipments.filter((x) => x.farmId !== farmId), ...remap(farmPayload.shipments || [])],
+          houseState: { ...next.houseState, ...(farmPayload.houseState || {}) },
+        };
+      }
+      return next;
+    });
+    showToast(fromCloud ? `${u.name}님, 데이터를 불러왔습니다` : "로그인되었습니다");
   };
 
   // 농장 코드 + 비밀번호로 바로 들어가기 (두 번째 사람, 회원가입 불필요)
@@ -1541,13 +1605,15 @@ function AuthScreen({ state, update, showToast }) {
             </>
           )}
 
-          <Btn kind="primary" onClick={mode === "signup" ? doSignup : doLogin} style={{ width: "100%", marginTop: 6 }}>
-            {mode === "signup" ? "가입하고 시작하기" : "로그인"}
+          <Btn kind="primary" onClick={mode === "signup" ? doSignup : doLogin}
+            disabled={loggingIn}
+            style={{ width: "100%", marginTop: 6, opacity: loggingIn ? 0.6 : 1 }}>
+            {mode === "signup" ? "가입하고 시작하기" : (loggingIn ? "확인 중…" : "로그인")}
           </Btn>
           <div style={{ color: T.faint, fontSize: 12.5, textAlign: "center", marginTop: 20, lineHeight: 1.6 }}>
             {mode === "signup"
-              ? "가입하면 농장 코드가 자동으로 만들어집니다. 그 코드를 함께 쓰는 분에게 알려주세요."
-              : "이 기기에 저장된 계정으로 로그인합니다."}
+              ? "가입하면 계정 정보가 서버에 저장됩니다. 어느 기기에서든 같은 아이디로 로그인하세요."
+              : "아이디와 비밀번호를 입력하면 서버에서 확인합니다. 어느 기기에서든 로그인할 수 있습니다."}
           </div>
         </>
       )}
