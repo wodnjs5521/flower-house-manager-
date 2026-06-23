@@ -285,6 +285,7 @@ function emptyState() {
     boxTemplates: [],     // {id, farmId, name, items:[{flower,variety,bundles}]}
     drafts: {},           // draftType -> {data, savedAt}
     houseState: {},       // houseId -> {vent:'open'|'closed', shade:bool}
+    ventAutoConfigs: {},  // houseId -> { enabled:bool, openTemp:23, closeTemp:10, openHour:8, closeHour:20, rainClose:true }
     settings: { morningTime: "06:00", morningEnabled: true },
     lastSelectedHouseId: null,
     customFlowers: {},    // userId -> { flowerName: {aliases,profile,prevention,addedAt} }
@@ -302,6 +303,7 @@ function withDefaults(data) {
     weatherHistory: data.weatherHistory || [],
     settings: { ...base.settings, ...(data.settings || {}) },
     customFlowers: data.customFlowers || {},
+    ventAutoConfigs: data.ventAutoConfigs || {},
   };
 }
 
@@ -1292,6 +1294,30 @@ function Root() {
     return () => { cancelled = true; };
   }, [farm?.id, farm?.lat, farm?.lng, earliestPlantingDate]);
 
+  // ---- 개폐기 자동화: 1분마다 + 날씨 변경 시 조건 재계산 ----
+  const [ventTick, setVentTick] = useState(0);
+  useEffect(() => {
+    const t = setInterval(() => setVentTick((n) => n + 1), 60000);
+    return () => clearInterval(t);
+  }, []);
+  useEffect(() => {
+    if (!farm) return;
+    const s = stateRef.current;
+    const configs = s.ventAutoConfigs || {};
+    const farmHouseIds = new Set(s.houses.filter((h) => h.farmId === farm.id).map((h) => h.id));
+    const updates = {};
+    for (const [houseId, cfg] of Object.entries(configs)) {
+      if (!farmHouseIds.has(houseId) || !cfg?.enabled) continue;
+      const autoState = computeAutoVentState(cfg, weather);
+      if (autoState && (s.houseState[houseId]?.vent !== autoState)) {
+        updates[houseId] = { ...(s.houseState[houseId] || {}), vent: autoState, updatedAt: Date.now() };
+      }
+    }
+    if (Object.keys(updates).length > 0) {
+      update((s) => ({ ...s, houseState: { ...s.houseState, ...updates } }));
+    }
+  }, [ventTick, weather.cur, weather.rainProb, farm?.id]);
+
   // ---- 라우팅 ----
   const [tab, setTab] = useState("today");
   const [detailHouseId, setDetailHouseId] = useState(null);
@@ -1986,6 +2012,20 @@ function Note() {
   );
 }
 
+/* ============================ 개폐기 자동화 =========================== */
+function computeAutoVentState(cfg, weather) {
+  if (!cfg?.enabled) return null;
+  const rainProb = weather?.rainProb ?? 0;
+  if (cfg.rainClose && rainProb >= 50) return "closed";
+  const now = new Date();
+  const hourNow = now.getHours() + now.getMinutes() / 60;
+  if (hourNow < cfg.openHour || hourNow >= cfg.closeHour) return "closed";
+  const temp = weather?.cur ?? ((weather?.high + weather?.low) / 2) ?? 20;
+  if (temp >= cfg.openTemp) return "open";
+  if (temp <= cfg.closeTemp) return "closed";
+  return "open";
+}
+
 /* ============================ 빠른 작업 화면 =========================== */
 const WORK_BUTTONS = [
   { key: "water", label: "물 줌", category: "watering", type: "관수", icon: "💧" },
@@ -2072,12 +2112,53 @@ const HISTORY_CATALOG = [
   },
 ];
 
+function PhotoCaptureModal({ houseId, houses, farm, update, showToast, onClose }) {
+  const house = houses.find((h) => h.id === houseId);
+  const fileRef = React.useRef();
+  React.useEffect(() => { setTimeout(() => fileRef.current?.click(), 80); }, []);
+  const handleFile = (e) => {
+    const file = e.target.files?.[0];
+    if (!file) { onClose(); return; }
+    const reader = new FileReader();
+    reader.onload = () => {
+      const dataUrl = reader.result;
+      const ts = Date.now();
+      update((s) => ({
+        ...s,
+        photoLogs: [{ id: uid(), farmId: farm.id, houseId, ts, dataUrl, name: file.name || "생육사진", memo: "" }, ...(s.photoLogs || [])],
+        workLogs: [{ id: uid(), farmId: farm.id, houseId, category: "photo", type: "생육사진", name: "사진 기록", ts, flower: house?.flower || "", quantity: "", unit: "", detail: "", memo: "" }, ...s.workLogs],
+      }));
+      showToast(`${house?.name || "하우스"} 사진 등록됨`);
+      onClose();
+    };
+    reader.readAsDataURL(file);
+  };
+  return (
+    <Modal onClose={onClose} title={`${house?.name || ""} 사진 기록`}>
+      <div style={{ textAlign: "center", padding: "16px 0 8px" }}>
+        <div style={{ fontSize: 15, color: T.sub, marginBottom: 20, lineHeight: 1.6 }}>
+          카메라가 열리면 사진을 찍어주세요.<br />찍는 즉시 등록됩니다.
+        </div>
+        <input ref={fileRef} type="file" accept="image/*" capture="environment"
+          style={{ display: "none" }} onChange={handleFile} />
+        <Btn kind="primary" onClick={() => fileRef.current?.click()} style={{ width: "100%", fontSize: 16 }}>
+          📷 카메라 열기
+        </Btn>
+        <div style={{ marginTop: 10, fontSize: 13, color: T.faint }}>
+          갤러리에서 선택해도 등록됩니다
+        </div>
+      </div>
+    </Modal>
+  );
+}
+
 function QuickScreen({ state, update, farm, showToast, setDetailHouseId, weather }) {
   const houses = state.houses.filter((h) => h.farmId === farm.id);
   const ctx = { workLogs: state.workLogs, harvestLogs: state.harvestLogs, houseState: state.houseState, weatherHistory: state.weatherHistory, weather };
   const [sel, setSel] = useState(() => (state.lastSelectedHouseId ? [state.lastSelectedHouseId] : []));
   const [pestModal, setPestModal] = useState(null); // {houses}
   const [memoModal, setMemoModal] = useState(null);
+  const [photoModal, setPhotoModal] = useState(null); // {houseId}
   const [catalogModal, setCatalogModal] = useState(false);
 
   const toggle = (id) => setSel((s) => (s.includes(id) ? s.filter((x) => x !== id) : [...s, id]));
@@ -2092,6 +2173,10 @@ function QuickScreen({ state, update, farm, showToast, setDetailHouseId, weather
     if (sel.length === 0) return showToast("하우스를 먼저 선택하세요");
     if (btn.key === "pest") return setPestModal({ houses: [...sel] });
     if (btn.key === "memo") return setMemoModal({ houses: [...sel] });
+    if (btn.key === "photo") {
+      if (sel.length !== 1) return showToast("사진 기록은 하우스 1개만 선택하세요");
+      return setPhotoModal({ houseId: sel[0] });
+    }
 
     const ts = Date.now();
     const logs = sel.map((houseId) => {
@@ -2161,6 +2246,7 @@ function QuickScreen({ state, update, farm, showToast, setDetailHouseId, weather
           {houses.map((h) => {
             const e = computeHouseEstimate(h, ctx);
             const on = sel.includes(h.id);
+            const isAutoVent = (state.ventAutoConfigs || {})[h.id]?.enabled;
             return (
               <button key={h.id} onClick={() => toggle(h.id)}
                 style={{
@@ -2170,7 +2256,10 @@ function QuickScreen({ state, update, farm, showToast, setDetailHouseId, weather
                 <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
                   <HouseShape number={h.number} status={e.status} flowerColor={colorHex(h.color)} width={52} open={(state.houseState[h.id] || {}).vent === "open"} beds={parseInt(h.bedCount) || 0} />
                   <div style={{ flex: 1, minWidth: 0 }}>
-                    <div style={{ fontWeight: 800 }}>{h.name}</div>
+                    <div style={{ fontWeight: 800 }}>
+                      {h.name}
+                      {isAutoVent && <span style={{ fontSize: 10, background: T.accent + "33", color: T.accent, borderRadius: 6, padding: "1px 5px", marginLeft: 5, fontWeight: 800 }}>자동</span>}
+                    </div>
                     <div style={{ fontSize: 13, color: T.sub, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{h.flower || "미등록"}</div>
                   </div>
                   <span style={{ fontSize: 24, flexShrink: 0, color: on ? T.accent : T.faint }}>{on ? "☑" : "☐"}</span>
@@ -2239,6 +2328,10 @@ function QuickScreen({ state, update, farm, showToast, setDetailHouseId, weather
       {memoModal && (
         <MemoModal update={update} farm={farm} houses={houses} targetHouses={memoModal.houses}
           onClose={() => setMemoModal(null)} showToast={showToast} />
+      )}
+      {photoModal && (
+        <PhotoCaptureModal houseId={photoModal.houseId} houses={houses} farm={farm}
+          update={update} showToast={showToast} onClose={() => setPhotoModal(null)} />
       )}
       {catalogModal && (
         <HistoryCatalogModal selCount={sel.length} onClose={() => setCatalogModal(false)} onRecord={recordHistory} />
@@ -4175,6 +4268,80 @@ function HouseDetail({ state, update, farm, user, houseId, onBack, showToast, we
             </div>
           )}
         </Card>
+
+        {(() => {
+          const DEFAULT_VENT_CFG = { enabled: false, openTemp: 23, closeTemp: 10, openHour: 8, closeHour: 20, rainClose: true };
+          const ventCfg = { ...DEFAULT_VENT_CFG, ...((state.ventAutoConfigs || {})[houseId] || {}) };
+          const updateVentCfg = (patch) => update((s) => ({
+            ...s,
+            ventAutoConfigs: { ...(s.ventAutoConfigs || {}), [houseId]: { ...ventCfg, ...patch } },
+          }));
+          const autoResult = computeAutoVentState(ventCfg, weather);
+          return (
+            <Card style={{ marginBottom: 10 }}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10 }}>
+                <div style={{ fontSize: 15, fontWeight: 800, color: T.sub, letterSpacing: 0.2 }}>개폐기 자동화</div>
+                <button onClick={() => updateVentCfg({ enabled: !ventCfg.enabled })}
+                  style={{
+                    background: ventCfg.enabled ? T.accent : T.panel2,
+                    color: ventCfg.enabled ? T.accentInk : T.faint,
+                    border: `1px solid ${ventCfg.enabled ? T.accent : T.line}`,
+                    borderRadius: 20, padding: "7px 16px", fontWeight: 800, fontSize: 14, cursor: "pointer",
+                  }}>
+                  {ventCfg.enabled ? "자동 켜짐" : "수동"}
+                </button>
+              </div>
+              {ventCfg.enabled ? (
+                <>
+                  <div style={{ background: T.panel2, borderRadius: 10, padding: "10px 12px", marginBottom: 12 }}>
+                    <div style={{ fontSize: 12.5, color: T.accent, fontWeight: 800, marginBottom: 4 }}>현재 자동 계산 결과</div>
+                    <div style={{ fontSize: 16, fontWeight: 800 }}>{autoResult === "open" ? "열림 ▲" : "닫힘 ▼"}</div>
+                    {ventCfg.rainClose && weather.rainProb >= 50 && (
+                      <div style={{ color: T.caution, fontSize: 12.5, marginTop: 4 }}>강수확률 {weather.rainProb}% → 비 우선 닫힘</div>
+                    )}
+                  </div>
+                  <div style={{ fontSize: 13, fontWeight: 800, color: T.ok, marginBottom: 6 }}>여는 조건</div>
+                  <div style={{ display: "flex", gap: 8, marginBottom: 12 }}>
+                    <Field label="온도 이상 열기 (℃)" style={{ flex: 1 }}>
+                      <input type="number" style={inputStyle} value={ventCfg.openTemp}
+                        onChange={(ev) => updateVentCfg({ openTemp: Number(ev.target.value) })} />
+                    </Field>
+                    <Field label="열기 시작 시각 (시)" style={{ flex: 1 }}>
+                      <input type="number" style={inputStyle} min={0} max={23} value={ventCfg.openHour}
+                        onChange={(ev) => updateVentCfg({ openHour: Math.max(0, Math.min(23, Number(ev.target.value))) })} />
+                    </Field>
+                  </div>
+                  <div style={{ fontSize: 13, fontWeight: 800, color: T.caution, marginBottom: 6 }}>닫는 조건</div>
+                  <div style={{ display: "flex", gap: 8, marginBottom: 12 }}>
+                    <Field label="온도 이하 닫기 (℃)" style={{ flex: 1 }}>
+                      <input type="number" style={inputStyle} value={ventCfg.closeTemp}
+                        onChange={(ev) => updateVentCfg({ closeTemp: Number(ev.target.value) })} />
+                    </Field>
+                    <Field label="닫기 시작 시각 (시)" style={{ flex: 1 }}>
+                      <input type="number" style={inputStyle} min={0} max={23} value={ventCfg.closeHour}
+                        onChange={(ev) => updateVentCfg({ closeHour: Math.max(0, Math.min(23, Number(ev.target.value))) })} />
+                    </Field>
+                  </div>
+                  <label style={{ display: "flex", alignItems: "center", gap: 10, cursor: "pointer", marginBottom: 12 }}>
+                    <input type="checkbox" checked={ventCfg.rainClose}
+                      onChange={(ev) => updateVentCfg({ rainClose: ev.target.checked })}
+                      style={{ width: 20, height: 20 }} />
+                    <span style={{ fontSize: 14, color: T.ink }}>비 올 때 닫기 (강수확률 50% 이상)</span>
+                  </label>
+                  <div style={{ background: T.accent + "11", borderRadius: 9, padding: "10px 12px", fontSize: 12.5, color: T.sub, lineHeight: 1.65 }}>
+                    우선순위: 비 → 시간 범위 → 온도 순으로 적용됩니다.<br />
+                    현재 기온 {weather.cur}℃ · 강수확률 {weather.rainProb}%
+                  </div>
+                </>
+              ) : (
+                <div style={{ fontSize: 13, color: T.faint, lineHeight: 1.6 }}>
+                  수동 모드입니다. 빠른 작업에서 직접 개폐기를 열고 닫습니다.<br />
+                  자동으로 바꾸면 조건을 설정해 날씨·시간에 따라 자동으로 계산됩니다.
+                </div>
+              )}
+            </Card>
+          );
+        })()}
 
         <Card style={{ marginBottom: 10 }}>
           <SectionTitle>절화 전 예방 체크리스트</SectionTitle>
