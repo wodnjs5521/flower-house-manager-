@@ -1,0 +1,55 @@
+rules_version = '2';
+
+/*
+  화훼 하우스 매니저 — Firestore 보안 규칙 (권장)
+  ----------------------------------------------------------------------------
+  Firebase 콘솔 → Firestore Database → 규칙(Rules)에 붙여넣고 "게시"하세요.
+
+  중요 사실
+  - 소스에 들어 있는 Firebase `apiKey`는 "비밀"이 아니라 프로젝트 식별자입니다.
+    클라이언트 앱에서는 숨길 수 없고, 노출돼도 그 자체로는 위험하지 않습니다.
+    실제 보안은 "이 규칙"이 결정합니다. (구글 공식 문서도 동일하게 안내)
+  - 이 앱은 로그인(Auth) 없이 "농장 코드"를 공유 비밀로 사용합니다.
+    따라서 코드를 아는 사람은 그 농장 문서를 읽고 쓸 수 있습니다(설계상 의도).
+  - 39단계부터 농장 참여 비밀번호(joinPassword)는 해시로 저장되므로,
+    이 문서를 읽더라도 평문 비밀번호는 보이지 않습니다.
+
+  아래 기본 규칙은 최소한의 보호입니다:
+  - farms/{code} 문서에만 접근 허용 (그 외 컬렉션 전면 차단)
+  - 저장 구조를 강제(payload 문자열 + updatedAt 숫자)하고 문서 크기를 제한
+    → DB를 임의 저장소로 악용하거나 거대한 데이터를 밀어넣는 것을 방지
+*/
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    match /farms/{code} {
+      // 농장 코드 형식만 허용 (예: FARM-AB3K9). 너무 짧거나 이상한 키 차단.
+      allow read: if code.matches('^[A-Za-z0-9_-]{4,40}$');
+
+      allow write: if code.matches('^[A-Za-z0-9_-]{4,40}$')
+        && request.resource.data.keys().hasOnly(['payload', 'updatedAt'])
+        && request.resource.data.payload is string
+        && request.resource.data.payload.size() < 900000      // Firestore 1MB 한도 안쪽
+        && request.resource.data.updatedAt is int;
+    }
+
+    // 그 외 모든 경로는 차단
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
+
+/*
+  ── 더 강한 보안이 필요하면 (선택) ──────────────────────────────────────────
+  Firebase Authentication(익명 또는 이메일 로그인)을 켜고, 농장 문서에
+  허용된 사용자 uid 목록(members)을 두어 본인만 읽기/쓰기 하도록 제한할 수 있습니다.
+  이 경우 앱 코드도 로그인/uid 처리를 추가해야 하므로 별도 작업이 필요합니다.
+
+  예시(개념):
+    match /farms/{code} {
+      allow read, write: if request.auth != null
+        && request.auth.uid in resource.data.members;
+    }
+*/

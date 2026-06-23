@@ -1,0 +1,5203 @@
+import React, { useState, useEffect, useRef, useMemo, useCallback } from "react";
+
+/* ============================================================================
+   화훼 하우스 매니저 (Flower House Manager)
+   센서 없는 화훼농가용 현장형 웹/PWA 앱 — MVP 1단계
+   ----------------------------------------------------------------------------
+   설계 메모:
+   - 이 환경(Artifacts)은 localStorage를 쓸 수 없으므로 in-memory store + 주기적
+     스냅샷으로 "자동 저장 / 강제 종료 복구"의 동작을 그대로 재현한다.
+   - 실제 배포 시 store.persist()/store.load() 부분만 SQLite/Hive/IndexedDB로
+     교체하면 동일 구조가 동작하도록 단일 영속 계층(persist)으로 분리했다.
+   - 모든 작업은 하우스별 개별 로그(work_logs)로 저장. 일괄 선택은 UI 편의일 뿐.
+   - 센서 없음 → 모든 판단은 "추정값"으로 표기.
+   ========================================================================== */
+
+/* ----------------------------- 디자인 토큰 ------------------------------- */
+const T = {
+  bg: "#10130E",          // 깊은 잎-그림자 그린블랙 (실외 햇빛 대비 다크)
+  panel: "#1A1F16",
+  panel2: "#222A1D",
+  line: "#41512F",
+  ink: "#F2F6EC",
+  sub: "#BCC8B0",
+  faint: "#94A687",
+  // 상태 색 (녹/노/주/빨)
+  ok: "#5FAE5A",
+  watch: "#E6C34A",
+  caution: "#E08A3C",
+  danger: "#E0533C",
+  // 강조: 화훼 — 리시안셔스 보라빛
+  accent: "#B98CD6",
+  accentInk: "#2A1838",
+  white: "#FFFFFF",
+};
+
+const STATUS = {
+  ok: { label: "안정", color: T.ok, band: "녹색" },
+  watch: { label: "관심", color: T.watch, band: "노랑" },
+  caution: { label: "주의", color: T.caution, band: "주황" },
+  danger: { label: "위험", color: T.danger, band: "빨강" },
+};
+
+function statusFromScore(s) {
+  if (s <= 25) return "ok";
+  if (s <= 50) return "watch";
+  if (s <= 75) return "caution";
+  return "danger";
+}
+
+/* ----------------------------- 유틸 ------------------------------------- */
+const uid = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+const localISODate = (value = Date.now()) => {
+  const d = new Date(value);
+  return new Date(d.getTime() - d.getTimezoneOffset() * 60000).toISOString().slice(0, 10);
+};
+const todayISO = () => localISODate();
+const nowHM = () =>
+  new Date().toLocaleTimeString("ko-KR", { hour: "2-digit", minute: "2-digit", hour12: false });
+
+function fmtDate(iso) {
+  if (!iso) return "—";
+  const d = new Date(iso);
+  return `${d.getMonth() + 1}/${d.getDate()}`;
+}
+function fmtDateFull(iso) {
+  if (!iso) return "—";
+  const d = new Date(`${iso}T12:00:00`);
+  return `${d.getFullYear()}년 ${d.getMonth() + 1}월 ${d.getDate()}일`;
+}
+function addDaysISO(iso, days) {
+  const d = new Date(`${iso}T12:00:00`);
+  d.setDate(d.getDate() + Math.round(days));
+  return d.toISOString().slice(0, 10);
+}
+function dayDiff(fromIso, toIso = todayISO()) {
+  const a = new Date(`${fromIso}T12:00:00`).getTime();
+  const b = new Date(`${toIso}T12:00:00`).getTime();
+  return Math.round((b - a) / 86400000);
+}
+function fmtDateTime(ts) {
+  const d = new Date(ts);
+  return `${d.getMonth() + 1}/${d.getDate()} ${String(d.getHours()).padStart(2, "0")}:${String(
+    d.getMinutes()
+  ).padStart(2, "0")}`;
+}
+function daysAgo(ts) {
+  if (!ts) return null;
+  const diff = Date.now() - new Date(ts).getTime();
+  return Math.floor(diff / 86400000);
+}
+function daysAgoLabel(ts) {
+  const d = daysAgo(ts);
+  if (d === null) return "기록 없음";
+  if (d === 0) return "오늘";
+  return `${d}일 전`;
+}
+
+/* ----------------------- 꽃 기본 프로필 (추정 계산용) -------------------- */
+/* ===== 비밀번호 해시 (평문 저장 방지) =====
+   배포(https)·localhost 등 보안 컨텍스트: PBKDF2-SHA256(crypto.subtle).
+   일부 file:// 등 비보안 컨텍스트: 경량 폴백 해시(약하지만 평문 노출은 방지).
+   기존 평문 비밀번호도 그대로 로그인되며(레거시 호환), 로그인 성공 시 해시로 자동 업그레이드. */
+const PWD_SCHEME = "fhm1";
+function _b64FromBytes(bytes) { let s = ""; for (let i = 0; i < bytes.length; i++) s += String.fromCharCode(bytes[i]); return btoa(s); }
+function _bytesFromB64(b64) { const s = atob(b64); const a = new Uint8Array(s.length); for (let i = 0; i < s.length; i++) a[i] = s.charCodeAt(i); return a; }
+function _randSaltB64(n) {
+  const a = new Uint8Array(n);
+  if (typeof crypto !== "undefined" && crypto.getRandomValues) crypto.getRandomValues(a);
+  else for (let i = 0; i < n; i++) a[i] = Math.floor(Math.random() * 256);
+  return _b64FromBytes(a);
+}
+function _fallbackHash(plain, saltB64) {
+  const salt = saltB64 || _randSaltB64(8);
+  let h = 2166136261 >>> 0;
+  const str = salt + "::" + String(plain);
+  for (let i = 0; i < str.length; i++) { h ^= str.charCodeAt(i); h = Math.imul(h, 16777619) >>> 0; }
+  for (let r = 0; r < 2000; r++) { h ^= (r + str.length); h = Math.imul(h, 16777619) >>> 0; }
+  return `${PWD_SCHEME}$f$${salt}$${(h >>> 0).toString(16)}`;
+}
+async function hashPwd(plain) {
+  try {
+    if (typeof crypto !== "undefined" && crypto.subtle) {
+      const enc = new TextEncoder();
+      const salt = crypto.getRandomValues(new Uint8Array(16));
+      const key = await crypto.subtle.importKey("raw", enc.encode(String(plain)), "PBKDF2", false, ["deriveBits"]);
+      const bits = await crypto.subtle.deriveBits({ name: "PBKDF2", salt, iterations: 100000, hash: "SHA-256" }, key, 256);
+      return `${PWD_SCHEME}$p$${_b64FromBytes(salt)}$${_b64FromBytes(new Uint8Array(bits))}`;
+    }
+  } catch (e) {}
+  return _fallbackHash(plain, null);
+}
+async function verifyPwd(plain, stored) {
+  if (stored == null) return false;
+  const s = String(stored);
+  if (s.startsWith(PWD_SCHEME + "$")) {
+    const parts = s.split("$"); // [scheme, kind, salt, hash]
+    const kind = parts[1], saltB64 = parts[2], hash = parts[3];
+    if (kind === "p") {
+      try {
+        const enc = new TextEncoder();
+        const salt = _bytesFromB64(saltB64);
+        const key = await crypto.subtle.importKey("raw", enc.encode(String(plain)), "PBKDF2", false, ["deriveBits"]);
+        const bits = await crypto.subtle.deriveBits({ name: "PBKDF2", salt, iterations: 100000, hash: "SHA-256" }, key, 256);
+        return _b64FromBytes(new Uint8Array(bits)) === hash;
+      } catch (e) { return false; }
+    }
+    return _fallbackHash(plain, saltB64) === s;
+  }
+  return String(plain) === s; // 레거시 평문 호환
+}
+function isHashedPwd(stored) { return stored != null && String(stored).startsWith(PWD_SCHEME + "$"); }
+
+const FLOWER_PROFILES = {
+  장미: { heat: 0.9, humidity: 0.8, water: 2, bloomDays: [55, 80], cutOffset: -1, optimum: [18, 26], sens: "응애·흰가루병" },
+  리시안셔스: { heat: 1.0, humidity: 0.7, water: 2, bloomDays: [90, 120], cutOffset: 0, optimum: [18, 24], sens: "잿빛곰팡이" },
+  국화: { heat: 0.7, humidity: 1.0, water: 3, bloomDays: [70, 100], cutOffset: 0, optimum: [17, 23], sens: "흰가루병·총채벌레" },
+  작약: { heat: 0.6, humidity: 0.6, water: 3, bloomDays: [300, 420], cutOffset: -2, optimum: [12, 22], sens: "잿빛곰팡이" },
+  거베라: { heat: 0.8, humidity: 0.9, water: 2, bloomDays: [90, 120], cutOffset: 0, optimum: [18, 25], sens: "응애·총채벌레" },
+  카네이션: { heat: 0.7, humidity: 0.8, water: 2, bloomDays: [120, 150], cutOffset: -1, optimum: [15, 22], sens: "시들음병" },
+  튤립: { heat: 0.5, humidity: 0.6, water: 2, bloomDays: [45, 70], cutOffset: -2, optimum: [12, 18], sens: "잿빛곰팡이" },
+  라넌큘러스: { heat: 0.6, humidity: 0.7, water: 2, bloomDays: [90, 120], cutOffset: -1, optimum: [10, 18], sens: "잿빛곰팡이" },
+  프리지아: { heat: 0.6, humidity: 0.7, water: 2, bloomDays: [100, 140], cutOffset: -1, optimum: [12, 18], sens: "구근부패" },
+  백합: { heat: 0.8, humidity: 0.8, water: 2, bloomDays: [70, 100], cutOffset: -2, optimum: [16, 24], sens: "잎마름병" },
+  해바라기: { heat: 0.9, humidity: 0.6, water: 2, bloomDays: [55, 75], cutOffset: -1, optimum: [20, 28], sens: "균핵병" },
+  달리아: { heat: 0.8, humidity: 0.7, water: 2, bloomDays: [75, 100], cutOffset: 0, optimum: [18, 25], sens: "응애·흰가루병" },
+  수국: { heat: 0.7, humidity: 0.9, water: 2, bloomDays: [90, 120], cutOffset: 1, optimum: [16, 24], sens: "잿빛곰팡이" },
+  안개초: { heat: 0.8, humidity: 0.6, water: 2, bloomDays: [70, 95], cutOffset: 0, optimum: [16, 24], sens: "시들음병" },
+  금어초: { heat: 0.6, humidity: 0.7, water: 2, bloomDays: [70, 100], cutOffset: -1, optimum: [12, 20], sens: "녹병" },
+  스토크: { heat: 0.5, humidity: 0.7, water: 2, bloomDays: [75, 105], cutOffset: -1, optimum: [10, 18], sens: "잿빛곰팡이" },
+  스타티스: { heat: 0.8, humidity: 0.5, water: 3, bloomDays: [100, 135], cutOffset: 0, optimum: [16, 24], sens: "뿌리썩음" },
+  아네모네: { heat: 0.5, humidity: 0.7, water: 2, bloomDays: [85, 115], cutOffset: -1, optimum: [10, 18], sens: "잿빛곰팡이" },
+  글라디올러스: { heat: 0.9, humidity: 0.7, water: 2, bloomDays: [70, 95], cutOffset: -2, optimum: [18, 27], sens: "총채벌레" },
+  마트리카리아: { heat: 0.7, humidity: 0.9, water: 2, bloomDays: [80, 110], cutOffset: -1, optimum: [15, 24], sens: "흰가루병·잿빛곰팡이" },
+  기타: { heat: 0.8, humidity: 0.8, water: 2, bloomDays: [75, 110], cutOffset: -1, optimum: [17, 25], sens: "—" },
+};
+const FLOWER_LIST = Object.keys(FLOWER_PROFILES);
+
+/* --- 사용자 커스텀 꽃 (로그인 시 Root에서 동기화) --- */
+let _activeCustomFlowers = {};
+function setActiveCustomFlowers(userId, customFlowers) {
+  _activeCustomFlowers = (userId && customFlowers && customFlowers[userId]) ? customFlowers[userId] : {};
+}
+
+function flowerProfile(name) {
+  const n = (name || "").replace(/\s/g, "").toLowerCase();
+  // 커스텀 꽃 먼저 확인
+  for (const [key, custom] of Object.entries(_activeCustomFlowers)) {
+    const cAliases = Array.isArray(custom.aliases) ? custom.aliases : [key];
+    if (cAliases.some((a) => n.includes(a.replace(/\s/g, "").toLowerCase()))) {
+      return { key, profile: { ...FLOWER_PROFILES.기타, ...custom.profile }, exact: true, isCustom: true };
+    }
+  }
+  const aliases = {
+    장미: ["장미", "rose"], 리시안셔스: ["리시안셔스", "리시안서스", "리시안사스", "리시안시스", "꽃도라지", "유스토마", "lisianthus", "eustoma"],
+    마트리카리아: ["마트리카리아", "화란국화", "피버퓨", "feverfew", "matricaria", "tanacetum", "parthenium", "캐모마일", "카모마일", "chamomile", "chamomilla"],
+    국화: ["국화", "chrysanthemum"], 작약: ["작약", "peony"], 거베라: ["거베라", "gerbera"],
+    카네이션: ["카네이션", "carnation"], 튤립: ["튤립", "tulip"],
+    라넌큘러스: ["라넌큘러스", "ranunculus"], 프리지아: ["프리지아", "freesia"],
+    백합: ["백합", "나리", "lily"], 해바라기: ["해바라기", "sunflower"], 달리아: ["달리아", "dahlia"],
+    수국: ["수국", "hydrangea"], 안개초: ["안개초", "안개꽃", "집소필라", "gypsophila"],
+    금어초: ["금어초", "스냅드래곤", "snapdragon"], 스토크: ["스토크", "stockflower", "matthiola"],
+    스타티스: ["스타티스", "리모니움", "statice", "limonium"], 아네모네: ["아네모네", "anemone"],
+    글라디올러스: ["글라디올러스", "gladiolus"],
+  };
+  const key = Object.keys(aliases).find((k) => aliases[k].some((a) => n.includes(a)));
+  return { key: key || "기타", profile: FLOWER_PROFILES[key] || FLOWER_PROFILES.기타, exact: !!key };
+}
+
+/* 커스텀 꽃 포함 병해충 데이터 조회 */
+function getFlowerPrevention(key) {
+  if (_activeCustomFlowers[key]?.prevention) {
+    const p = _activeCustomFlowers[key].prevention;
+    return {
+      source: p.source || "", pests: p.pests || [], diseases: p.diseases || [],
+      caution: p.caution || "", details: [], generalPrevention: p.generalPrevention || [],
+    };
+  }
+  return FLOWER_PREVENTION[key] || FLOWER_PREVENTION["기타"];
+}
+
+function plantingRoundsFor(house) {
+  const saved = Array.isArray(house.plantingRounds)
+    ? house.plantingRounds.filter((r) => r?.date).map((r, i) => ({ round: i + 1, date: r.date }))
+    : [];
+  if (saved.length) return saved;
+  return house.plantingDate ? [{ round: 1, date: house.plantingDate }] : [];
+}
+
+/* 색상 이름 → 표시용 hex (하우스 아이콘 점 색) */
+const COLOR_HEX = {
+  "빨강": "#E0533C", "빨간색": "#E0533C", "레드": "#E0533C",
+  "분홍": "#E78AB5", "핑크": "#E78AB5", "연분홍": "#F0A8C8",
+  "노랑": "#E6C34A", "노란색": "#E6C34A", "옐로우": "#E6C34A",
+  "주황": "#E08A3C", "오렌지": "#E08A3C",
+  "보라": "#B98CD6", "보라색": "#B98CD6", "퍼플": "#B98CD6",
+  "흰색": "#EDF1E6", "하양": "#EDF1E6", "백색": "#EDF1E6", "화이트": "#EDF1E6",
+  "파랑": "#5B8DEF", "블루": "#5B8DEF",
+  "초록": "#5FAE5A", "그린": "#5FAE5A",
+};
+function colorHex(name) {
+  if (!name) return null;
+  return COLOR_HEX[name.trim()] || null;
+}
+
+/* ---------------- 전국 시·도 → 시·군·구 대표 좌표 (내장, 검색 API 불필요) ------------- */
+const KR_REGIONS = {
+  "서울": [["서울 전역",37.5665,126.978]],
+  "부산": [["부산 전역",35.1796,129.0756]],
+  "대구": [["대구 전역",35.8714,128.6014]],
+  "인천": [["인천 전역",37.4563,126.7052],["강화군",37.747,126.4878],["옹진군",37.4467,126.637]],
+  "광주": [["광주 전역",35.1595,126.8526]],
+  "대전": [["대전 전역",36.3504,127.3845]],
+  "울산": [["울산 전역",35.5384,129.3114],["울주군",35.5222,129.2424]],
+  "세종": [["세종 전역",36.48,127.289]],
+  "경기": [["수원시",37.2636,127.0286],["성남시",37.42,127.1267],["고양시",37.6584,126.832],["용인시",37.2411,127.1776],["부천시",37.5034,126.766],["안산시",37.3219,126.8309],["안양시",37.3943,126.9568],["남양주시",37.636,127.2165],["화성시",37.1996,126.8312],["평택시",36.9921,127.1129],["의정부시",37.7381,127.0337],["시흥시",37.38,126.803],["파주시",37.7599,126.78],["김포시",37.6152,126.7156],["광명시",37.4787,126.8646],["광주시",37.4292,127.255],["군포시",37.3617,126.9352],["이천시",37.2722,127.435],["양주시",37.7853,127.0456],["오산시",37.1499,127.0772],["구리시",37.5944,127.1296],["안성시",37.008,127.2797],["포천시",37.8949,127.2003],["의왕시",37.3446,126.9683],["하남시",37.5392,127.2148],["여주시",37.2982,127.6371],["양평군",37.4917,127.4875],["동두천시",37.9036,127.0606],["과천시",37.4292,126.9877],["가평군",37.8315,127.5106],["연천군",38.0966,127.0748]],
+  "강원": [["춘천시",37.8813,127.73],["원주시",37.3422,127.9202],["강릉시",37.7519,128.8761],["동해시",37.5247,129.1142],["태백시",37.164,128.9856],["속초시",38.207,128.5918],["삼척시",37.4499,129.1655],["홍천군",37.6971,127.8889],["횡성군",37.4917,127.985],["영월군",37.1836,128.4617],["평창군",37.3705,128.3902],["정선군",37.3807,128.6608],["철원군",38.1466,127.3134],["화천군",38.1063,127.7081],["양구군",38.1099,127.9899],["인제군",38.0697,128.1707],["고성군",38.3806,128.4678],["양양군",38.0754,128.619]],
+  "충북": [["청주시",36.6424,127.489],["충주시",36.991,127.9259],["제천시",37.1326,128.191],["보은군",36.4894,127.7294],["옥천군",36.3064,127.5713],["영동군",36.175,127.7763],["증평군",36.7855,127.5816],["진천군",36.8554,127.4355],["괴산군",36.8153,127.7866],["음성군",36.9402,127.6904],["단양군",36.9846,128.3656]],
+  "충남": [["천안시",36.8151,127.1139],["공주시",36.4465,127.119],["보령시",36.3334,126.6128],["아산시",36.7898,127.0019],["서산시",36.7848,126.4503],["논산시",36.1872,127.0987],["계룡시",36.2745,127.2486],["당진시",36.8897,126.6457],["금산군",36.1089,127.4881],["부여군",36.2756,126.9098],["서천군",36.0804,126.6915],["청양군",36.4592,126.8021],["홍성군",36.6014,126.6608],["예산군",36.6829,126.8447],["태안군",36.7456,126.2978]],
+  "전북": [["전주시",35.8242,127.148],["군산시",35.9676,126.7369],["익산시",35.9483,126.9577],["정읍시",35.5699,126.8559],["남원시",35.4164,127.3905],["김제시",35.8036,126.8809],["완주군",35.9046,127.162],["진안군",35.7917,127.4248],["무주군",36.0068,127.6608],["장수군",35.6473,127.5212],["임실군",35.6177,127.2891],["순창군",35.3744,127.1374],["고창군",35.4357,126.7019],["부안군",35.7318,126.733]],
+  "전남": [["목포시",34.8118,126.3922],["여수시",34.7604,127.6622],["순천시",34.9506,127.4872],["나주시",35.016,126.7108],["광양시",34.9407,127.6959],["담양군",35.3211,126.9881],["곡성군",35.282,127.292],["구례군",35.2024,127.4628],["고흥군",34.6111,127.2849],["보성군",34.7715,127.08],["화순군",35.0645,126.9866],["장흥군",34.6816,126.907],["강진군",34.642,126.7672],["해남군",34.5734,126.599],["영암군",34.8001,126.6967],["무안군",34.9904,126.4817],["함평군",35.0658,126.5166],["영광군",35.2772,126.512],["장성군",35.3019,126.7848],["완도군",34.311,126.7551],["진도군",34.4868,126.2634],["신안군",34.8336,126.3514]],
+  "경북": [["포항시",36.019,129.3435],["경주시",35.8562,129.2247],["김천시",36.1398,128.1136],["안동시",36.5684,128.7294],["구미시",36.1196,128.3441],["영주시",36.8057,128.624],["영천시",35.9733,128.9386],["상주시",36.4109,128.159],["문경시",36.5866,128.1867],["경산시",35.8251,128.7416],["군위군",36.2429,128.5729],["의성군",36.3527,128.697],["청송군",36.4361,129.057],["영양군",36.6667,129.1124],["영덕군",36.415,129.3656],["청도군",35.6475,128.7339],["고령군",35.7259,128.2628],["성주군",35.9192,128.2829],["칠곡군",35.9954,128.4017],["예천군",36.6577,128.4527],["봉화군",36.8932,128.7325],["울진군",36.993,129.4006],["울릉군",37.4845,130.9057]],
+  "경남": [["창원시",35.228,128.6811],["진주시",35.18,128.1076],["통영시",34.8544,128.4331],["사천시",35.0036,128.0642],["김해시",35.2285,128.8894],["밀양시",35.5038,128.7466],["거제시",34.8806,128.6211],["양산시",35.335,129.0378],["의령군",35.3222,128.2616],["함안군",35.2724,128.4065],["창녕군",35.5444,128.4922],["고성군",34.973,128.3223],["남해군",34.8376,127.8924],["하동군",35.0672,127.7514],["산청군",35.4154,127.8736],["함양군",35.5205,127.7251],["거창군",35.6868,127.9095],["합천군",35.5666,128.1658]],
+  "제주": [["제주시",33.4996,126.5312],["서귀포시",33.2541,126.56]],
+};
+
+/* ============================ 영속 계층 ================================= */
+/* 실제 앱에서는 이 부분만 SQLite/Hive/IndexedDB로 교체.
+   여기서는 모듈 스코프 메모리 + window 스냅샷으로 "강제 종료 복구"를 흉내낸다. */
+const memoryStore = { data: null };
+
+function emptyState() {
+  return {
+    schemaVersion: 1,
+    users: [],            // {id,name,login,pwd}
+    session: null,        // userId
+    farms: [],            // {id, ownerId, name, region, lat, lng, memo}
+    activeFarmId: null,
+    houses: [],           // {id, farmId, number, name, flower, variety, color, plantingDate, seedlingDate, expectedTotal, unit, lat, lng, qr, memo}
+    workLogs: [],         // {id, farmId, houseId, category, type, name, ts, flower, quantity, unit, detail, memo}
+    photoLogs: [],
+    weatherHistory: [],   // {farmId,date,meanTemp,maxTemp,minTemp,rain,humidity,et0,source}
+    harvestLogs: [],      // {id, houseId, ts, amount, unit, percent, quality, memo}
+    shipments: [],        // {id, farmId, ts, destination, status, packed, scheduledDate, transport, boxes:[{n, items:[{flower,variety,bundles}]}]}
+    destinations: [],     // {id, farmId, name, contact, phone, memo}
+    boxTemplates: [],     // {id, farmId, name, items:[{flower,variety,bundles}]}
+    drafts: {},           // draftType -> {data, savedAt}
+    houseState: {},       // houseId -> {vent:'open'|'closed', shade:bool}
+    settings: { morningTime: "06:00", morningEnabled: true },
+    lastSelectedHouseId: null,
+    customFlowers: {},    // userId -> { flowerName: {aliases,profile,prevention,addedAt} }
+  };
+}
+
+/* 저장된 데이터에 새 필드가 없으면 기본값으로 보강 (앱 업데이트 호환) */
+function withDefaults(data) {
+  const base = emptyState();
+  return {
+    ...base,
+    ...data,
+    destinations: data.destinations || [],
+    boxTemplates: data.boxTemplates || [],
+    weatherHistory: data.weatherHistory || [],
+    settings: { ...base.settings, ...(data.settings || {}) },
+    customFlowers: data.customFlowers || {},
+  };
+}
+
+/* ===================== 2인 공유: 데이터 병합 ===========================
+   두 기기의 데이터를 합친다. 통째로 덮어쓰지 않고:
+   - id가 있는 기록(작업/수확/출하/하우스/출하처/템플릿)은 id 기준 합집합(중복 제거)
+   - houseState 같은 단일 상태값은 더 최근(updatedAt)을 채택
+   동시에 입력해도 양쪽 기록이 모두 살아남는다.
+====================================================================== */
+function mergeById(localArr = [], incomingArr = []) {
+  const map = new Map();
+  for (const item of localArr) map.set(item.id, item);
+  for (const item of incomingArr) {
+    const existing = map.get(item.id);
+    if (!existing) map.set(item.id, item);
+    else {
+      // 같은 id면 더 최근 수정본 채택 (updatedAt 없으면 기존 유지)
+      const a = existing.updatedAt || existing.ts || 0;
+      const b = item.updatedAt || item.ts || 0;
+      if (b > a) map.set(item.id, item);
+    }
+  }
+  return Array.from(map.values());
+}
+
+function mergeHouseState(localHS = {}, incomingHS = {}) {
+  const out = { ...localHS };
+  for (const [hid, inc] of Object.entries(incomingHS)) {
+    const cur = out[hid];
+    if (!cur) out[hid] = inc;
+    else {
+      // 개폐기/차광망 현재 상태는 더 최근에 바뀐 쪽
+      const a = cur.updatedAt || 0;
+      const b = inc.updatedAt || 0;
+      out[hid] = b >= a ? inc : cur;
+    }
+  }
+  return out;
+}
+
+function mergeFarmData(local, incoming) {
+  // 기준 메타(농장명, 위치 등)는 더 최근 수정본 채택, 없으면 로컬 유지
+  const farms = mergeById(local.farms, incoming.farms);
+  const houses = mergeById(local.houses, incoming.houses);
+  return {
+    ...local,
+    farms,
+    houses,
+    workLogs: mergeById(local.workLogs, incoming.workLogs).sort((a, b) => b.ts - a.ts),
+    harvestLogs: mergeById(local.harvestLogs, incoming.harvestLogs).sort((a, b) => b.ts - a.ts),
+    shipments: mergeById(local.shipments, incoming.shipments).sort((a, b) => b.ts - a.ts),
+    photoLogs: mergeById(local.photoLogs, incoming.photoLogs),
+    destinations: mergeById(local.destinations, incoming.destinations),
+    boxTemplates: mergeById(local.boxTemplates, incoming.boxTemplates),
+    houseState: mergeHouseState(local.houseState, incoming.houseState),
+  };
+}
+
+/* 공유용 페이로드: 현재 농장 + 그 농장의 기록만 추려서 내보낸다 */
+function buildSharePayload(state, farmId) {
+  const inFarm = (x) => x.farmId === farmId;
+  const houseIds = new Set(state.houses.filter((h) => h.farmId === farmId).map((h) => h.id));
+  const hs = {};
+  Object.entries(state.houseState || {}).forEach(([hid, v]) => { if (houseIds.has(hid)) hs[hid] = v; });
+  return {
+    fhmShare: 1,
+    farm: state.farms.find((f) => f.id === farmId),
+    houses: state.houses.filter(inFarm),
+    workLogs: state.workLogs.filter(inFarm),
+    harvestLogs: state.harvestLogs.filter(inFarm),
+    shipments: state.shipments.filter(inFarm),
+    photoLogs: (state.photoLogs || []).filter(inFarm),
+    destinations: (state.destinations || []).filter(inFarm),
+    boxTemplates: (state.boxTemplates || []).filter(inFarm),
+    houseState: hs,
+    exportedAt: Date.now(),
+  };
+}
+
+const persist = {
+  load() {
+    if (memoryStore.data) return memoryStore.data;
+    try {
+      if (typeof window !== "undefined" && window.__FHM_SNAPSHOT__) {
+        memoryStore.data = withDefaults(JSON.parse(window.__FHM_SNAPSHOT__));
+        return memoryStore.data;
+      }
+    } catch (e) {}
+    memoryStore.data = emptyState();
+    return memoryStore.data;
+  },
+  save(state) {
+    memoryStore.data = state;
+    try {
+      if (typeof window !== "undefined") {
+        window.__FHM_SNAPSHOT__ = JSON.stringify(state); // 강제 종료 복구 스냅샷
+      }
+    } catch (e) {}
+  },
+};
+
+/* ============================ 추정 엔진 ================================= */
+/* 외부 날씨(모의) + 작업 이력으로 하우스 스트레스/위험/예측을 추정 */
+
+function mockWeather(farm) {
+  // 실제로는 외부 날씨 API. 여기서는 지역명/날짜 기반 의사난수로 안정적인 값 생성.
+  const seed = (farm?.region || "지역").split("").reduce((a, c) => a + c.charCodeAt(0), 0);
+  const day = new Date().getDate();
+  const r = (n) => ((Math.sin(seed * 9301 + day * 49297 + n * 233) + 1) / 2);
+  const high = Math.round(24 + r(1) * 12);          // 24~36
+  const low = Math.round(high - 6 - r(2) * 4);
+  const humidity = Math.round(55 + r(3) * 35);       // 55~90
+  const rainProb = Math.round(r(4) * 60);
+  const fog = r(5) > 0.7;
+  const sky = rainProb > 45 ? "흐림/비 가능" : r(6) > 0.5 ? "맑음" : "구름 조금";
+  return {
+    cur: Math.round(low + (high - low) * 0.6),
+    high,
+    low,
+    humidity,
+    rainProb,
+    fog,
+    sky,
+    heatRisk: high >= 32,
+    source: "mock",
+  };
+}
+
+/* WMO 날씨 코드 → 한국어 하늘 상태 */
+function wmoSky(code) {
+  if (code === 0) return "맑음";
+  if (code <= 2) return "구름 조금";
+  if (code === 3) return "흐림";
+  if (code >= 45 && code <= 48) return "안개";
+  if (code >= 51 && code <= 67) return "비/이슬비";
+  if (code >= 71 && code <= 77) return "눈";
+  if (code >= 80 && code <= 82) return "소나기";
+  if (code >= 95) return "뇌우";
+  return "흐림/비 가능";
+}
+
+/* 실제 날씨 가져오기 (Open-Meteo, 인증키 불필요, 브라우저에서 직접 호출) */
+async function fetchRealWeather(lat, lng) {
+  const url =
+    "https://api.open-meteo.com/v1/forecast" +
+    `?latitude=${lat}&longitude=${lng}` +
+    "&current=temperature_2m,relative_humidity_2m,precipitation,weather_code,wind_speed_10m" +
+    "&daily=temperature_2m_max,temperature_2m_min,precipitation_probability_max,weather_code" +
+    "&hourly=relative_humidity_2m,visibility" +
+    "&timezone=Asia%2FSeoul&forecast_days=2";
+  const res = await fetch(url);
+  if (!res.ok) throw new Error("weather fetch failed");
+  const d = await res.json();
+  const cur = d.current || {};
+  const day = d.daily || {};
+  const code = day.weather_code?.[0] ?? cur.weather_code ?? 3;
+  // 안개 가능성: 가시거리 낮음 또는 코드 45~48
+  let fog = code >= 45 && code <= 48;
+  try {
+    const vis = d.hourly?.visibility || [];
+    const minVis = Math.min(...vis.slice(0, 12).filter((v) => typeof v === "number"));
+    if (minVis < 1000) fog = true;
+  } catch (e) {}
+  const high = Math.round(day.temperature_2m_max?.[0] ?? cur.temperature_2m ?? 26);
+  const low = Math.round(day.temperature_2m_min?.[0] ?? high - 6);
+  return {
+    cur: Math.round(cur.temperature_2m ?? (high + low) / 2),
+    high,
+    low,
+    humidity: Math.round(cur.relative_humidity_2m ?? 60),
+    rain: Number(cur.precipitation) || 0,
+    rainProb: Math.round(day.precipitation_probability_max?.[0] ?? 0),
+    wind: Math.round((cur.wind_speed_10m ?? 0)),
+    fog,
+    sky: wmoSky(code),
+    heatRisk: high >= 32,
+    tomorrowHigh: Math.round(day.temperature_2m_max?.[1] ?? high),
+    tomorrowLow: Math.round(day.temperature_2m_min?.[1] ?? low),
+    tomorrowSky: wmoSky(day.weather_code?.[1] ?? code),
+    source: "live",
+    fetchedAt: Date.now(),
+  };
+}
+
+/* 정식 이후 실제 일별 날씨 이력 (Open-Meteo 재분석 자료) */
+async function fetchWeatherHistory(lat, lng, startDate, endDate) {
+  if (!startDate || !endDate || startDate > endDate) return [];
+  const url =
+    "https://archive-api.open-meteo.com/v1/archive" +
+    `?latitude=${lat}&longitude=${lng}&start_date=${startDate}&end_date=${endDate}` +
+    "&daily=temperature_2m_mean,temperature_2m_max,temperature_2m_min,precipitation_sum,relative_humidity_2m_mean,et0_fao_evapotranspiration" +
+    "&timezone=Asia%2FSeoul";
+  const res = await fetch(url);
+  if (!res.ok) throw new Error("weather history fetch failed");
+  const d = await res.json();
+  const daily = d.daily || {};
+  return (daily.time || []).map((date, i) => ({
+    date,
+    meanTemp: Number(daily.temperature_2m_mean?.[i]),
+    maxTemp: Number(daily.temperature_2m_max?.[i]),
+    minTemp: Number(daily.temperature_2m_min?.[i]),
+    rain: Number(daily.precipitation_sum?.[i]) || 0,
+    humidity: Number(daily.relative_humidity_2m_mean?.[i]),
+    et0: Number(daily.et0_fao_evapotranspiration?.[i]) || 0,
+    source: "open-meteo-history",
+  }));
+}
+
+/* 지역명 → 좌표 (Open-Meteo 지오코딩, 한국어 지원) */
+async function geocodeRegion(name) {
+  const url = `https://geocoding-api.open-meteo.com/v1/search?name=${encodeURIComponent(name)}&count=5&language=ko&format=json`;
+  const res = await fetch(url);
+  if (!res.ok) throw new Error("geocode failed");
+  const d = await res.json();
+  return (d.results || []).map((r) => ({
+    name: r.name,
+    admin1: r.admin1 || "",
+    country: r.country || "",
+    lat: r.latitude,
+    lng: r.longitude,
+  }));
+}
+
+/* 공유 날씨 훅: 농장 좌표가 있으면 실제 날씨, 없으면 모의값. 30분 캐시. */
+function useWeather(farm) {
+  const [weather, setWeather] = useState(() => mockWeather(farm));
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    if (farm?.lat != null && farm?.lng != null) {
+      setLoading(true);
+      setError(null);
+      fetchRealWeather(farm.lat, farm.lng)
+        .then((w) => { if (!cancelled) setWeather(w); })
+        .catch(() => {
+          if (!cancelled) { setError("offline"); setWeather(mockWeather(farm)); }
+        })
+        .finally(() => { if (!cancelled) setLoading(false); });
+    } else {
+      setWeather(mockWeather(farm));
+    }
+    return () => { cancelled = true; };
+  }, [farm?.id, farm?.lat, farm?.lng]);
+
+  return { weather, loading, error };
+}
+
+function estimateBloomCalendar(house, ctx, profInfo, plantingRound = null) {
+  const plantingDate = plantingRound?.date || house.plantingDate;
+  if (!plantingDate) return null;
+  const round = plantingRound?.round || 1;
+  const { profile: prof, key: profileName, exact } = profInfo;
+  const today = todayISO();
+  const elapsed = Math.max(0, dayDiff(plantingDate, today));
+  const weatherDays = (ctx.weatherHistory || [])
+    .filter((w) => w.farmId === house.farmId && w.date >= plantingDate && w.date <= today)
+    .sort((a, b) => a.date.localeCompare(b.date));
+  const wateringDates = new Set(
+    (ctx.workLogs || [])
+      .filter((w) => w.houseId === house.id && w.category === "watering" && w.ts >= new Date(`${plantingDate}T00:00:00`).getTime())
+      .map((w) => localISODate(w.ts))
+  );
+
+  let adjustment = 0;
+  let tempAdjustment = 0;
+  let waterAdjustment = 0;
+  if (weatherDays.length >= 3) {
+    const temps = weatherDays.map((w) => w.meanTemp).filter(Number.isFinite);
+    if (temps.length) {
+      const avg = temps.reduce((a, n) => a + n, 0) / temps.length;
+      const [low, high] = prof.optimum;
+      if (avg < low) tempAdjustment = Math.min(24, (low - avg) * 1.15);
+      else if (avg > high) tempAdjustment = Math.min(18, (avg - high) * 0.8);
+      else tempAdjustment = -Math.min(5, weatherDays.length / 30);
+    }
+    const dryDemand = weatherDays.reduce((a, w) => a + Math.max(0, (w.et0 || 0) - (w.rain || 0)), 0);
+    if (wateringDates.size > 0) {
+      const expectedWaterings = Math.max(1, elapsed / Math.max(1, prof.water));
+      const coverage = wateringDates.size / expectedWaterings;
+      if (coverage < 0.45 && dryDemand > weatherDays.length * 1.5) waterAdjustment = Math.min(14, (0.45 - coverage) * 25);
+      else if (coverage >= 0.8) waterAdjustment = -Math.min(3, coverage * 2);
+    }
+  } else if (wateringDates.size > 0) {
+    const expectedWaterings = Math.max(1, elapsed / Math.max(1, prof.water));
+    if (wateringDates.size < expectedWaterings * 0.4) waterAdjustment = Math.min(10, expectedWaterings * 0.4 - wateringDates.size);
+  }
+  adjustment = Math.round(tempAdjustment + waterAdjustment);
+
+  const centerDays = Math.max(1, Math.round((prof.bloomDays[0] + prof.bloomDays[1]) / 2 + adjustment));
+  const centerDate = addDaysISO(plantingDate, centerDays);
+  const minDate = addDaysISO(centerDate, -3);
+  const maxDate = addDaysISO(centerDate, 3);
+  const cutCenterDate = addDaysISO(centerDate, prof.cutOffset || 0);
+  const cutMinDate = addDaysISO(cutCenterDate, -3);
+  const cutMaxDate = addDaysISO(cutCenterDate, 3);
+  const actualBloom = (ctx.workLogs || [])
+    .filter((w) => w.houseId === house.id && (w.type === "개화" || String(w.name || "").includes("꽃 피었")))
+    .sort((a, b) => a.ts - b.ts)[0];
+  const confidence = Math.min(92, 45 + (exact ? 15 : 0) + Math.min(22, weatherDays.length / 3) + (wateringDates.size ? 10 : 0));
+  return {
+    profileName,
+    round,
+    plantingDate,
+    minDate,
+    maxDate,
+    centerDate,
+    cutCenterDate,
+    cutMinDate,
+    cutMaxDate,
+    actualDate: actualBloom ? localISODate(actualBloom.ts) : null,
+    daysMin: dayDiff(today, minDate),
+    daysMax: dayDiff(today, maxDate),
+    adjustment,
+    weatherDays: weatherDays.length,
+    wateringCount: wateringDates.size,
+    confidence: Math.round(confidence),
+    basis: weatherDays.length || wateringDates.size
+      ? `${round}차 정식일 + ${profileName} 생육기간 + 실제 날씨 ${weatherDays.length}일 + 관수 ${wateringDates.size}회`
+      : `${round}차 정식일 + ${profileName} 기본 생육기간`,
+  };
+}
+
+/* 꽃 사진 후보를 여러 장 확인해 로고·지도·인물·그림 등을 제외한다. */
+async function fetchFlowerImage(name, excluded = []) {
+  if (!name || !name.trim()) return null;
+  const info = flowerProfile(name);
+  const aliases = {
+    장미: "rose flower", 리시안셔스: "lisianthus eustoma flower", 국화: "chrysanthemum flower",
+    작약: "peony flower", 거베라: "gerbera flower", 카네이션: "carnation flower",
+    튤립: "tulip flower", 라넌큘러스: "ranunculus flower", 프리지아: "freesia flower",
+    백합: "lily flower", 해바라기: "sunflower", 달리아: "dahlia flower",
+    수국: "hydrangea flower", 안개초: "gypsophila flower", 금어초: "snapdragon flower",
+    스토크: "matthiola flower", 스타티스: "limonium flower", 아네모네: "anemone flower",
+    글라디올러스: "gladiolus flower",
+    마트리카리아: "feverfew tanacetum parthenium flower",
+  };
+  const queries = [
+    `${name.trim()} 꽃 식물`,
+    aliases[info.key] || `${name.trim()} flower plant`,
+    `${info.key} 꽃 근접 사진`,
+  ];
+  const rejected = /(logo|map|flag|icon|diagram|chart|drawing|illustration|painting|portrait|person|people|building|stamp|coat of arms|heraldry|poster|book|text|로고|지도|국기|도표|삽화|그림|인물|사람|건물|우표|문장)/i;
+  const positive = /(flower|flowers|floral|blossom|bloom|plant|flora|garden|꽃|개화|식물|화훼)/i;
+  const excludedSet = new Set(excluded);
+
+  for (const query of queries) {
+    try {
+      const url =
+        "https://commons.wikimedia.org/w/api.php?action=query&format=json&origin=*" +
+        "&generator=search&gsrnamespace=6&gsrlimit=15" +
+        `&gsrsearch=${encodeURIComponent(query)}` +
+        "&prop=imageinfo&iiprop=url|mime|mediatype|extmetadata&iiurlwidth=480";
+      const res = await fetch(url);
+      if (!res.ok) continue;
+      const data = await res.json();
+      const candidates = Object.values(data?.query?.pages || {}).map((page) => {
+        const image = page.imageinfo?.[0] || {};
+        const meta = image.extmetadata || {};
+        const text = [
+          page.title, meta.ImageDescription?.value, meta.ObjectName?.value,
+          meta.Categories?.value, meta.DepictedPeople?.value,
+        ].filter(Boolean).join(" ").replace(/<[^>]*>/g, " ");
+        let score = 0;
+        if (positive.test(text)) score += 4;
+        if (text.toLowerCase().includes(info.key.toLowerCase())) score += 5;
+        if (name.split(/\s+/).some((token) => token.length >= 2 && text.toLowerCase().includes(token.toLowerCase()))) score += 3;
+        if (image.mediatype === "BITMAP") score += 3;
+        if (/image\/(jpeg|webp)/i.test(image.mime || "")) score += 2;
+        if (rejected.test(text)) score -= 12;
+        if (/\.svg$/i.test(page.title || "")) score -= 10;
+        return { url: image.thumburl || image.url, title: page.title || "", score };
+      }).filter((c) => c.url && !excludedSet.has(c.url) && c.score >= 5)
+        .sort((a, b) => b.score - a.score);
+      if (candidates.length) return candidates[0];
+    } catch (e) {}
+  }
+  return null;
+}
+
+function computeHouseEstimate(house, ctx) {
+  const { workLogs, harvestLogs, houseState, weather } = ctx;
+  const profInfo = flowerProfile(house.flower);
+  const prof = profInfo.profile;
+  const hs = houseState[house.id] || { vent: "closed", shade: false };
+
+  const logsFor = workLogs.filter((w) => w.houseId === house.id);
+  const lastWater = logsFor.filter((w) => w.category === "watering").sort((a, b) => b.ts - a.ts)[0];
+  const lastPest = logsFor.filter((w) => w.category === "pesticide").sort((a, b) => b.ts - a.ts)[0];
+  const waterAgo = daysAgo(lastWater?.ts);
+  const pestAgo = daysAgo(lastPest?.ts);
+
+  // 활성 판단: 작업 기록이 하나도 없고 꽃/정식일도 없으면 '미시작'으로 보고 컨디션을 표시하지 않음
+  const hasAnyActivity = logsFor.length > 0 || harvestLogs.some((h) => h.houseId === house.id);
+  const hasSetup = !!house.flower || !!house.plantingDate || !!house.seedlingDate;
+  const active = hasAnyActivity || hasSetup;
+  // 센싱(관수 경과 위험)은 첫 관수 기록이 생긴 뒤부터만 작동
+  const wateringStarted = !!lastWater;
+
+  // --- 스트레스 점수 ---
+  let score = 0;
+  const reasons = [];
+  if (weather.heatRisk) { score += 20; reasons.push("외부 고온 예상"); }
+  if (weather.humidity >= 80) { score += 10; reasons.push("외부 습도 높음"); }
+  if (weather.low <= 8) { score += 12; reasons.push("외부 저온"); }
+  if (wateringStarted && waterAgo !== null && waterAgo >= prof.water) {
+    score += Math.min(25, 10 + (waterAgo - prof.water + 1) * 7);
+    reasons.push(`마지막 관수 ${waterAgo}일 경과`);
+  }
+  // 관수 기록이 아직 없으면 '관수 위험'을 매기지 않음 (물 줬다고 한 순간부터 센싱)
+  if (!hs.shade && weather.heatRisk) { score += 15; reasons.push("차광망 미사용"); }
+  if (hs.vent === "closed" && (weather.heatRisk || weather.humidity >= 80)) {
+    score += 12; reasons.push("개폐기 닫힘");
+  }
+
+  // 정식일 + 꽃별 생육기간 + 누적 실제 날씨 + 관수 이력으로 개화일 추정
+  const bloomEstimates = plantingRoundsFor(house)
+    .map((r) => estimateBloomCalendar(house, ctx, profInfo, r))
+    .filter(Boolean);
+  const bloomEstimate =
+    bloomEstimates.find((e) => e.centerDate >= todayISO()) ||
+    bloomEstimates[bloomEstimates.length - 1] ||
+    null;
+  let bloomInMin = null, bloomInMax = null;
+  if (bloomEstimate) {
+    bloomInMin = bloomEstimate.daysMin;
+    bloomInMax = bloomEstimate.daysMax;
+    if (bloomInMin <= 3 && bloomInMax >= -7) { score += 10; reasons.push("개화 임박"); }
+  }
+  score = Math.max(0, Math.min(100, Math.round(score)));
+
+  // --- 꽃 화상 위험 ---
+  let burn = 0;
+  if (weather.heatRisk) burn += 35 * prof.heat;
+  if (weather.sky === "맑음") burn += 12;
+  if (!hs.shade) burn += 18;
+  if (hs.vent === "closed") burn += 10;
+  if (bloomInMin !== null && bloomInMin <= 3 && bloomInMax >= -14) burn += 12;
+  if (waterAgo !== null && waterAgo >= prof.water) burn += 8;
+  burn = Math.max(0, Math.min(99, Math.round(burn)));
+
+  // --- 고습 병해 위험 ---
+  let disease = 0;
+  if (weather.humidity >= 80) disease += 30 * prof.humidity;
+  if (weather.fog) disease += 15;
+  if (hs.vent === "closed") disease += 15;
+  if (pestAgo !== null && pestAgo >= 7) disease += Math.min(25, (pestAgo - 6) * 4);
+  else if (pestAgo === null) disease += 10;
+  if (weather.rainProb >= 40) disease += 8;
+  disease = Math.max(0, Math.min(99, Math.round(disease)));
+
+  // --- 수확 진행률 (차수 개념) ---
+  const harvested = harvestLogs.filter((h) => h.houseId === house.id).sort((a, b) => b.ts - a.ts);
+  const totalHarvested = harvested.reduce((a, h) => a + (Number(h.amount) || 0), 0);
+  const expected = Number(house.expectedTotal) || 0;
+  const round = Math.max(1, Number(house.harvestRound) || 1); // 현재 차수 (1차, 2차…)
+  // 현재 차수에서만 딴 수량 (전체 누적 totalHarvested와 구분 — 차수가 올라가도 분모를 넘기지 않게)
+  const roundHarvested = harvested
+    .filter((h) => (Number(h.round) || 1) === round)
+    .reduce((a, h) => a + (Number(h.amount) || 0), 0);
+  let progress = 0; // 현재 차수 기준 0~100%
+  // 현재 차수에서 가장 최근에 기록한 누적 진행률
+  const latestPctLog = harvested.find((h) =>
+    (Number(h.round) || 1) === round && (h.progressMode === true || Number(h.percent) > 0)
+  );
+  if (latestPctLog) {
+    progress = Math.min(100, Number(latestPctLog.percent));
+  } else if (expected > 0 && round === 1) {
+    progress = Math.min(100, Math.round((totalHarvested / expected) * 100));
+  }
+  const cumulativePercent = (round - 1) * 100 + progress; // 누적 (115% 등)
+
+  // 추천 작업
+  const recs = [];
+  if (waterAgo !== null && waterAgo >= prof.water) recs.push("오전 중 물 주기");
+  if (burn >= 50 && !hs.shade) recs.push("오후 차광망 사용");
+  if (burn >= 50 && hs.vent === "closed") recs.push("오전 개폐기 열기");
+  if (disease >= 55) recs.push("오전 환기 및 병반 확인");
+  if (pestAgo !== null && pestAgo >= 9) recs.push("방제 확인");
+  if (bloomInMin !== null && bloomInMin <= 2 && bloomInMax >= -7 && progress < 70) recs.push("오전 우선 절화");
+  if (!recs.length) recs.push("오늘 별도 작업 없음");
+
+  return {
+    score,
+    status: statusFromScore(score),
+    active,
+    reasons,
+    burn,
+    disease,
+    waterAgo,
+    pestAgo,
+    lastWaterTs: lastWater?.ts || null,
+    lastPestTs: lastPest?.ts || null,
+    bloomInMin,
+    bloomInMax,
+    bloomEstimate,
+    bloomEstimates,
+    cutInMin: bloomEstimate ? dayDiff(todayISO(), bloomEstimate.cutMinDate) : null,
+    cutInMax: bloomEstimate ? dayDiff(todayISO(), bloomEstimate.cutMaxDate) : null,
+    progress,
+    round,
+    cumulativePercent,
+    totalHarvested,
+    roundHarvested,
+    expected,
+    recs,
+    vent: hs.vent,
+    shade: hs.shade,
+  };
+}
+
+/* ============================ 작은 UI 조각 ============================== */
+function Chip({ children, color, onClick, active, style }) {
+  return (
+    <button
+      onClick={onClick}
+      style={{
+        border: `1px solid ${active ? color || T.accent : T.line}`,
+        background: active ? (color || T.accent) + "22" : "transparent",
+        color: active ? T.ink : T.sub,
+        borderRadius: 999,
+        padding: "9px 15px",
+        fontSize: 15,
+        fontWeight: 700,
+        minHeight: 40,
+        cursor: "pointer",
+        whiteSpace: "nowrap",
+        ...style,
+      }}
+    >
+      {children}
+    </button>
+  );
+}
+
+function StatusDot({ status, size = 10 }) {
+  return (
+    <span
+      style={{
+        display: "inline-block",
+        width: size,
+        height: size,
+        borderRadius: "50%",
+        background: STATUS[status].color,
+        boxShadow: `0 0 0 3px ${STATUS[status].color}22`,
+      }}
+    />
+  );
+}
+
+function Gauge({ value, color }) {
+  return (
+    <div style={{ background: T.panel2, borderRadius: 8, height: 18, overflow: "hidden", border: `1px solid ${T.line}` }}>
+      <div
+        style={{
+          width: `${Math.max(2, value)}%`,
+          height: "100%",
+          background: color || T.accent,
+          transition: "width .4s ease",
+        }}
+      />
+    </div>
+  );
+}
+
+/* 실제 비닐하우스(아치형 터널)를 본뜬 하우스 아이콘 — 그라데이션 비닐막·바닥 그림자·
+   골조 후프·비닐 광택·두둑(이랑)+작물·지붕 동번호 라벨.
+   status=막 색, flowerColor=작물 색, open=측창 환기, beds=두둑 수(그 수만큼 표시). */
+function HouseShape({ number, status, flowerColor, width = 100, open, beds = 0 }) {
+  const W = width;
+  const H = W * 0.64;
+  const sc = STATUS[status]?.color || T.faint;
+  const dotColor = flowerColor || T.faint;
+  const sw = Math.max(1, W * 0.022);
+  const thin = Math.max(0.6, W * 0.012);
+  const cx = W / 2;
+  const groundY = H - W * 0.07;
+  const archTop = W * 0.05;
+  const rx = W * 0.45;
+  const ry = groundY - archTop;
+  const archL = cx - rx, archR = cx + rx;
+  const gid = useMemo(() => "hs" + Math.random().toString(36).slice(2, 9), []);
+  const hoop = (k) => `M ${cx - rx * k} ${groundY} A ${rx * k} ${ry * k} 0 0 1 ${cx + rx * k} ${groundY}`;
+  // 두둑(이랑): bedCount만큼 바닥에 표시. 미설정(0)이면 기본 2송이만.
+  const n = Math.max(0, Math.min(8, Math.round(Number(beds) || 0)));
+  const innerL = archL + W * 0.1, innerR = archR - W * 0.1, innerW = innerR - innerL;
+  const xs = n > 0
+    ? Array.from({ length: n }, (_, i) => innerL + innerW * ((i + 0.5) / n))
+    : [archL + W * 0.16, archR - W * 0.16];
+  const mrx = n > 0 ? Math.min(W * 0.08, (innerW / n) * 0.42) : W * 0.06;
+  const bloomR = Math.min(W * 0.05, n > 0 ? (innerW / n) * 0.3 : W * 0.05);
+  const bloomY = groundY - (n > 0 ? W * 0.1 : W * 0.085);
+  const numY = groundY - ry * 0.62;
+  return (
+    <svg width={W} height={H} viewBox={`0 0 ${W} ${H}`} style={{ display: "block" }}>
+      <defs>
+        <linearGradient id={`fg-${gid}`} x1="0" y1="0" x2="0" y2="1">
+          <stop offset="0%" stopColor="#FFFFFF" stopOpacity="0.24" />
+          <stop offset="40%" stopColor={sc} stopOpacity="0.15" />
+          <stop offset="100%" stopColor={sc} stopOpacity="0.38" />
+        </linearGradient>
+      </defs>
+      {/* 바닥 그림자 */}
+      <ellipse cx={cx} cy={groundY + W * 0.05} rx={rx * 0.94} ry={W * 0.04} fill="#000000" opacity="0.22" />
+      {/* 기초 빔 */}
+      <rect x={archL - W * 0.015} y={groundY - sw * 0.4} width={rx * 2 + W * 0.03} height={W * 0.05} rx={W * 0.018}
+        fill={T.panel2} stroke={sc + "66"} strokeWidth={thin} />
+      {/* 비닐막 (그라데이션) */}
+      <path d={`M ${archL} ${groundY} A ${rx} ${ry} 0 0 1 ${archR} ${groundY} Z`}
+        fill={`url(#fg-${gid})`} stroke={sc} strokeWidth={sw} strokeLinejoin="round" />
+      {/* 골조 후프(깊이감) */}
+      <path d={hoop(0.86)} fill="none" stroke={sc + "4D"} strokeWidth={thin} />
+      <path d={hoop(0.7)} fill="none" stroke={sc + "38"} strokeWidth={thin} />
+      {/* 비닐 광택 */}
+      <path d={`M ${cx - rx * 0.06} ${archTop + ry * 0.05} A ${rx * 0.74} ${ry * 0.74} 0 0 0 ${archL + rx * 0.28} ${groundY - ry * 0.46}`}
+        fill="none" stroke="#FFFFFF" strokeWidth={Math.max(0.8, W * 0.014)} opacity="0.32" strokeLinecap="round" />
+      {/* 두둑(이랑) + 작물 — beds 수만큼 */}
+      {xs.map((x, i) => (
+        <g key={i}>
+          {n > 0 && <path d={`M ${x - mrx} ${groundY} Q ${x} ${groundY - W * 0.12} ${x + mrx} ${groundY} Z`}
+            fill={T.line} stroke={sc + "55"} strokeWidth={thin * 0.8} />}
+          <circle cx={x} cy={bloomY} r={bloomR} fill={dotColor} opacity="0.95" />
+          <circle cx={x - bloomR * 0.3} cy={bloomY - bloomR * 0.4} r={bloomR * 0.32} fill="#FFFFFF" opacity="0.5" />
+        </g>
+      ))}
+      {/* 측창 환기(열림) */}
+      {open && [[archL + W * 0.05, archL + rx * 0.5], [archR - rx * 0.5, archR - W * 0.05]].map((seg, i) => (
+        <line key={i} x1={seg[0]} y1={groundY - ry * 0.17} x2={seg[1]} y2={groundY - ry * 0.17}
+          stroke="#FFFFFF" strokeWidth={sw * 1.3} opacity="0.6" strokeLinecap="round" />
+      ))}
+      {/* 동 번호 (지붕 라벨) */}
+      <circle cx={cx} cy={numY} r={W * 0.155} fill={T.bg} opacity="0.42" />
+      <text x={cx} y={numY} textAnchor="middle" dominantBaseline="central" fontSize={W * 0.2} fontWeight="800" fill={T.ink}>{number}</text>
+    </svg>
+  );
+}
+
+
+function RiskBar({ label, value }) {
+  const color = value >= 66 ? T.danger : value >= 40 ? T.caution : T.ok;
+  return (
+    <div style={{ marginBottom: 8 }}>
+      <div style={{ display: "flex", justifyContent: "space-between", fontSize: 14, color: T.sub, marginBottom: 5 }}>
+        <span>{label}</span>
+        <span style={{ color, fontWeight: 800 }}>{value}%</span>
+      </div>
+      <Gauge value={value} color={color} />
+    </div>
+  );
+}
+
+function Btn({ children, onClick, kind = "ghost", style, disabled }) {
+  const styles = {
+    primary: { background: T.accent, color: T.accentInk, border: "none" },
+    ghost: { background: T.panel2, color: T.ink, border: `1px solid ${T.line}` },
+    danger: { background: "transparent", color: T.danger, border: `1px solid ${T.danger}66` },
+    plain: { background: "transparent", color: T.sub, border: "none" },
+  };
+  return (
+    <button
+      onClick={onClick}
+      disabled={disabled}
+      style={{
+        borderRadius: 12,
+        padding: "15px 16px",
+        fontSize: 17,
+        fontWeight: 800,
+        minHeight: 54,
+        cursor: disabled ? "default" : "pointer",
+        opacity: disabled ? 0.4 : 1,
+        ...styles[kind],
+        ...style,
+      }}
+    >
+      {children}
+    </button>
+  );
+}
+
+function Card({ children, style, onClick }) {
+  return (
+    <div
+      onClick={onClick}
+      style={{
+        background: T.panel,
+        border: `1px solid ${T.line}`,
+        borderRadius: 16,
+        padding: 16,
+        ...style,
+      }}
+    >
+      {children}
+    </div>
+  );
+}
+
+function Field({ label, children }) {
+  return (
+    <label style={{ display: "block", marginBottom: 12 }}>
+      <div style={{ fontSize: 14, color: T.sub, marginBottom: 7, fontWeight: 700 }}>{label}</div>
+      {children}
+    </label>
+  );
+}
+
+const inputStyle = {
+  width: "100%",
+  boxSizing: "border-box",
+  background: T.panel2,
+  border: `1px solid ${T.line}`,
+  borderRadius: 12,
+  padding: "14px 15px",
+  color: T.ink,
+  fontSize: 17,
+  outline: "none",
+};
+
+function Toast({ msg }) {
+  if (!msg) return null;
+  return (
+    <div
+      style={{
+        position: "fixed",
+        bottom: 92,
+        left: "50%",
+        transform: "translateX(-50%)",
+        background: T.accent,
+        color: T.accentInk,
+        padding: "14px 22px",
+        borderRadius: 999,
+        fontWeight: 800,
+        fontSize: 16,
+        zIndex: 100,
+        boxShadow: "0 8px 24px rgba(0,0,0,.4)",
+        maxWidth: "90%",
+        textAlign: "center",
+      }}
+    >
+      {msg}
+    </div>
+  );
+}
+
+const ESTIMATE_NOTE =
+  "센서가 없는 환경에서 외부 날씨와 작업 기록을 바탕으로 계산한 추정값입니다. 실제 하우스 내부 환경과 다를 수 있습니다.";
+
+/* ===================== 자동 동기화 (Firebase) ==========================
+   두 폰이 같은 "농장 코드"의 문서를 공유한다. 한쪽이 쓰면 onSnapshot으로
+   다른 쪽에 자동 반영. Firebase 미설정/미로드 시 모든 함수가 무해하게 무시되어
+   앱은 로컬 전용으로 정상 동작한다 (.jsx 미리보기 호환).
+
+   설정 방법: 아래 FIREBASE_CONFIG 자리에 본인 Firebase 키를 넣으면 활성화됨.
+
+   보안 메모: 여기 apiKey는 "비밀"이 아니라 프로젝트 식별자라 클라이언트 앱에서는
+   숨길 수 없고, 노출돼도 그 자체로는 위험하지 않습니다. 실제 보안은 Firestore
+   보안 규칙이 결정합니다. 함께 동봉한 firestore.rules를 Firebase 콘솔에 게시하세요.
+====================================================================== */
+const FIREBASE_CONFIG = {
+  apiKey: "AIzaSyDMHdm7Ccb3p7Zq2120VsS8JYJQJmDSEGU",
+  authDomain: "flower-house-2d2ef.firebaseapp.com",
+  projectId: "flower-house-2d2ef",
+  storageBucket: "flower-house-2d2ef.firebasestorage.app",
+  messagingSenderId: "693295474201",
+  appId: "1:693295474201:web:2250fbce9f6f5941bf6c88",
+};
+
+const sync = {
+  db: null,
+  ready: false,
+  unsub: null,
+  init() {
+    if (this.ready) return true;
+    try {
+      // window.firebaseApi 는 HTML에서 CDN 로드 후 주입. 미리보기에선 없음.
+      if (typeof window === "undefined" || !window.firebaseApi) return false;
+      if (String(FIREBASE_CONFIG.apiKey).startsWith("여기에")) return false; // 미설정
+      const { initializeApp, getFirestore } = window.firebaseApi;
+      const app = initializeApp(FIREBASE_CONFIG);
+      this.db = getFirestore(app);
+      this.ready = true;
+      return true;
+    } catch (e) {
+      return false;
+    }
+  },
+  isConfigured() {
+    return typeof window !== "undefined" && !!window.firebaseApi && !String(FIREBASE_CONFIG.apiKey).startsWith("여기에");
+  },
+  // 농장 코드 문서를 구독. onRemote(payload) 가 원격 변경 시 호출됨.
+  subscribe(code, onRemote) {
+    if (!this.init()) return;
+    try {
+      const { doc, onSnapshot } = window.firebaseApi;
+      if (this.unsub) { this.unsub(); this.unsub = null; }
+      const ref = doc(this.db, "farms", code);
+      this.unsub = onSnapshot(ref, (snap) => {
+        if (snap.exists()) {
+          const data = snap.data();
+          if (data && data.payload) {
+            try { onRemote(JSON.parse(data.payload)); } catch (e) {}
+          }
+        }
+      });
+    } catch (e) {}
+  },
+  // 현재 농장 데이터를 원격에 저장
+  async push(code, payload) {
+    if (!this.init()) return;
+    try {
+      const { doc, setDoc } = window.firebaseApi;
+      const ref = doc(this.db, "farms", code);
+      await setDoc(ref, { payload: JSON.stringify(payload), updatedAt: Date.now() });
+    } catch (e) {}
+  },
+  // 농장 코드로 1회 조회 (두 번째 사람이 코드로 들어올 때)
+  async fetchByCode(code) {
+    if (!this.init()) return null;
+    try {
+      const { doc, getDoc } = window.firebaseApi;
+      const ref = doc(this.db, "farms", code);
+      const snap = await getDoc(ref);
+      if (snap.exists()) {
+        const data = snap.data();
+        if (data && data.payload) return JSON.parse(data.payload);
+      }
+      return null;
+    } catch (e) {
+      return null;
+    }
+  },
+  stop() {
+    if (this.unsub) { this.unsub(); this.unsub = null; }
+  },
+};
+
+export default function App() {
+  return <Root />;
+}
+
+/* The Root component and screens are defined in part 2 (appended below). */
+
+/* ============================ 루트 / 상태 관리 ========================== */
+function Root() {
+  const [state, setState] = useState(() => persist.load());
+  const stateRef = useRef(state);
+  stateRef.current = state;
+
+  // 자동 저장: 상태 변경 시 즉시 스냅샷 (버튼 누르는 순간 저장)
+  useEffect(() => {
+    persist.save(state);
+  }, [state]);
+
+  // 추가 안전장치: 1.5초마다 스냅샷 (입력 중 강제 종료 대비)
+  useEffect(() => {
+    const t = setInterval(() => persist.save(stateRef.current), 1500);
+    return () => clearInterval(t);
+  }, []);
+
+  const update = useCallback((fn) => {
+    setState((s) => {
+      const next = typeof fn === "function" ? fn(s) : fn;
+      return { ...next };
+    });
+  }, []);
+
+  const [toast, setToast] = useState("");
+  const toastTimer = useRef();
+  const showToast = useCallback((msg) => {
+    setToast(msg);
+    clearTimeout(toastTimer.current);
+    toastTimer.current = setTimeout(() => setToast(""), 2200);
+  }, []);
+
+  const [fbReady, setFbReady] = useState(false);
+  useEffect(() => {
+    if (typeof window !== "undefined" && window.firebaseApi) { setFbReady(true); return; }
+    const h = () => setFbReady(true);
+    if (typeof window !== "undefined") window.addEventListener("firebase-ready", h);
+    return () => { if (typeof window !== "undefined") window.removeEventListener("firebase-ready", h); };
+  }, []);
+
+  const user = state.users.find((u) => u.id === state.session) || null;
+  const farm = state.farms.find((f) => f.id === state.activeFarmId) || null;
+  // flowerProfile() 커스텀 꽃 동기화 (렌더마다 최신 상태 유지)
+  setActiveCustomFlowers(state.session, state.customFlowers);
+  const syncCode = farm?.syncCode || null;
+
+  // ---- 자동 동기화: 구독 (원격 변경 → 로컬 병합) ----
+  const applyingRemote = useRef(false);
+  const lastPushed = useRef("");
+  useEffect(() => {
+    if (!syncCode || !sync.isConfigured()) return;
+    sync.subscribe(syncCode, (remotePayload) => {
+      applyingRemote.current = true;
+      setState((s) => {
+        const localFarmId = s.activeFarmId;
+        const remap = (arr) => (arr || []).map((x) => ({ ...x, farmId: localFarmId }));
+        const incoming = {
+          farms: [], houses: remap(remotePayload.houses), workLogs: remap(remotePayload.workLogs),
+          harvestLogs: remap(remotePayload.harvestLogs), shipments: remap(remotePayload.shipments),
+          photoLogs: remap(remotePayload.photoLogs), destinations: remap(remotePayload.destinations),
+          boxTemplates: remap(remotePayload.boxTemplates), houseState: remotePayload.houseState || {},
+        };
+        return mergeFarmData(s, incoming);
+      });
+      setTimeout(() => { applyingRemote.current = false; }, 50);
+    });
+    return () => sync.stop();
+  }, [syncCode, fbReady]);
+
+  // ---- 자동 동기화: 로컬 변경 → 원격 push (디바운스 1.2초) ----
+  useEffect(() => {
+    if (!syncCode || !sync.isConfigured()) return;
+    if (applyingRemote.current) return; // 원격 적용 중엔 push 안 함 (루프 방지)
+    const t = setTimeout(() => {
+      const payload = buildSharePayload(stateRef.current, stateRef.current.activeFarmId);
+      const str = JSON.stringify(payload);
+      if (str !== lastPushed.current) {
+        lastPushed.current = str;
+        sync.push(syncCode, payload);
+      }
+    }, 1200);
+    return () => clearTimeout(t);
+  }, [state, syncCode]);
+
+  // 공유 날씨 (실제 API). 훅은 조건문 이전에 호출해야 하므로 여기서.
+  const { weather, loading: weatherLoading, error: weatherError } = useWeather(farm);
+  const weatherHistoryFetchRef = useRef("");
+  const farmPlantingDates = state.houses
+    .filter((h) => h.farmId === farm?.id)
+    .flatMap((h) => plantingRoundsFor(h).map((r) => r.date))
+    .sort();
+  const earliestPlantingDate = farmPlantingDates[0] || null;
+
+  // 오늘의 실제 날씨도 일별 기록에 누적한다.
+  useEffect(() => {
+    if (!farm || weather.source !== "live") return;
+    const item = {
+      farmId: farm.id, date: todayISO(),
+      meanTemp: (Number(weather.high) + Number(weather.low)) / 2,
+      maxTemp: Number(weather.high), minTemp: Number(weather.low),
+      rain: Number(weather.rain) || 0, humidity: Number(weather.humidity),
+      et0: 0, source: "open-meteo-live",
+    };
+    setState((s) => {
+      const prev = s.weatherHistory || [];
+      const old = prev.find((w) => w.farmId === item.farmId && w.date === item.date);
+      if (old && old.source === item.source && old.meanTemp === item.meanTemp && old.humidity === item.humidity) return s;
+      return { ...s, weatherHistory: [...prev.filter((w) => !(w.farmId === item.farmId && w.date === item.date)), item] };
+    });
+  }, [farm?.id, weather.source, weather.fetchedAt]);
+
+  // 정식일부터 어제까지 실제 날씨를 불러와 누적한다. 실패해도 정식일 기본 예측은 유지된다.
+  useEffect(() => {
+    if (!farm || farm.lat == null || farm.lng == null || !earliestPlantingDate) return;
+    const yesterday = addDaysISO(todayISO(), -1);
+    const oldestAllowed = addDaysISO(todayISO(), -450);
+    const start = earliestPlantingDate < oldestAllowed ? oldestAllowed : earliestPlantingDate;
+    if (start > yesterday) return;
+    const key = `${farm.id}:${farm.lat}:${farm.lng}:${start}:${yesterday}`;
+    if (weatherHistoryFetchRef.current === key) return;
+    weatherHistoryFetchRef.current = key;
+    let cancelled = false;
+    fetchWeatherHistory(farm.lat, farm.lng, start, yesterday).then((items) => {
+      if (cancelled || !items.length) return;
+      setState((s) => {
+        const other = (s.weatherHistory || []).filter((w) => w.farmId !== farm.id || w.date < start || w.date > yesterday);
+        return { ...s, weatherHistory: [...other, ...items.map((w) => ({ ...w, farmId: farm.id }))] };
+      });
+    }).catch(() => {});
+    return () => { cancelled = true; };
+  }, [farm?.id, farm?.lat, farm?.lng, earliestPlantingDate]);
+
+  // ---- 라우팅 ----
+  const [tab, setTab] = useState("today");
+  const [detailHouseId, setDetailHouseId] = useState(null);
+
+  if (!user) return <AuthScreen state={state} update={update} showToast={showToast} />;
+  if (!farm) return <FarmSetupScreen state={state} update={update} user={user} showToast={showToast} />;
+
+  const screenProps = { state, update, user, farm, showToast, setTab, setDetailHouseId, weather, weatherLoading, weatherError };
+
+  return (
+    <div style={shell}>
+      <Toast msg={toast} />
+      {detailHouseId ? (
+        <HouseDetail
+          {...screenProps}
+          houseId={detailHouseId}
+          onBack={() => setDetailHouseId(null)}
+        />
+      ) : (
+        <>
+          <div style={{ flex: 1, overflowY: "auto", paddingBottom: 88 }}>
+            {tab === "today" && <TodayScreen {...screenProps} />}
+            {tab === "quick" && <QuickScreen {...screenProps} />}
+            {tab === "harvest" && <HarvestScreen {...screenProps} />}
+            {tab === "shipment" && <ShipmentScreen {...screenProps} />}
+            {tab === "history" && <HistoryScreen {...screenProps} />}
+            {tab === "settings" && <SettingsScreen {...screenProps} />}
+          </div>
+          <TabBar tab={tab} setTab={setTab} />
+        </>
+      )}
+    </div>
+  );
+}
+
+const shell = {
+  maxWidth: 460,
+  margin: "0 auto",
+  minHeight: "100vh",
+  background: T.bg,
+  color: T.ink,
+  fontFamily:
+    "'Pretendard', -apple-system, BlinkMacSystemFont, 'Apple SD Gothic Neo', 'Malgun Gothic', sans-serif",
+  display: "flex",
+  flexDirection: "column",
+  position: "relative",
+  WebkitTapHighlightColor: "transparent",
+};
+
+/* ----------------------------- 탭 바 ----------------------------------- */
+function TabBar({ tab, setTab }) {
+  const tabs = [
+    { id: "today", label: "오늘", icon: "◎" },
+    { id: "quick", label: "작업", icon: "✛" },
+    { id: "harvest", label: "수확", icon: "✿" },
+    { id: "shipment", label: "출하", icon: "▣" },
+    { id: "history", label: "하우스", icon: "⌂" },
+    { id: "settings", label: "설정", icon: "⚙" },
+  ];
+  return (
+    <div
+      style={{
+        position: "fixed",
+        bottom: 0,
+        left: 0,
+        right: 0,
+        maxWidth: 460,
+        margin: "0 auto",
+        background: T.panel,
+        borderTop: `1px solid ${T.line}`,
+        display: "flex",
+        paddingBottom: "env(safe-area-inset-bottom)",
+      }}
+    >
+      {tabs.map((t) => (
+        <button
+          key={t.id}
+          onClick={() => setTab(t.id)}
+          aria-label={t.label}
+          aria-current={tab === t.id ? "page" : undefined}
+          style={{
+            flex: 1,
+            background: tab === t.id ? T.accent + "1A" : "none",
+            border: "none",
+            borderTop: tab === t.id ? `3px solid ${T.accent}` : "3px solid transparent",
+            padding: "10px 1px 13px",
+            cursor: "pointer",
+            color: tab === t.id ? T.accent : T.sub,
+          }}
+        >
+          <div style={{ fontSize: 25, lineHeight: 1 }}>{t.icon}</div>
+          <div style={{ fontSize: 13, marginTop: 5, fontWeight: 800 }}>{t.label}</div>
+        </button>
+      ))}
+    </div>
+  );
+}
+
+/* ============================ 인증 화면 ================================= */
+function AuthScreen({ state, update, showToast }) {
+  const [mode, setMode] = useState("login"); // login | signup
+  const [form, setForm] = useState({
+    name: "", login: "", pwd: "", farmName: "", region: "", houses: "",
+  });
+  const set = (k) => (e) => setForm((f) => ({ ...f, [k]: e.target.value }));
+
+  const doSignup = async () => {
+    if (!form.name || !form.login || !form.pwd) return showToast("이름·아이디·비밀번호를 입력하세요");
+    if (state.users.some((u) => u.login === form.login)) return showToast("이미 있는 아이디입니다");
+    const userId = uid();
+    const farmId = uid();
+    const autoCode = "FARM-" + Math.random().toString(36).slice(2, 7).toUpperCase();
+    const pwdHash = await hashPwd(form.pwd);
+    const n = Math.max(0, Math.min(60, parseInt(form.houses) || 0));
+    const houses = Array.from({ length: n }, (_, i) => ({
+      id: uid(),
+      farmId,
+      number: i + 1,
+      name: `${i + 1}동`,
+      flower: "",
+      variety: "",
+      color: "",
+      plantingDate: "",
+      seedlingDate: "",
+      expectedTotal: "",
+      unit: "송이",
+      lat: null,
+      lng: null,
+      qr: `FHM-${i + 1}`,
+      memo: "",
+    }));
+    update((s) => ({
+      ...s,
+      users: [...s.users, { id: userId, name: form.name, login: form.login, pwd: pwdHash }],
+      session: userId,
+      farms: form.farmName
+        ? [...s.farms, { id: farmId, ownerId: userId, name: form.farmName, region: form.region, lat: null, lng: null, memo: "", syncCode: autoCode, joinPassword: pwdHash }]
+        : s.farms,
+      activeFarmId: form.farmName ? farmId : null,
+      houses: form.farmName ? [...s.houses, ...houses] : s.houses,
+    }));
+    showToast(`환영합니다, ${form.name}님`);
+  };
+
+  const doLogin = async () => {
+    const u = state.users.find((x) => x.login === form.login);
+    if (!u || !(await verifyPwd(form.pwd, u.pwd))) return showToast("아이디 또는 비밀번호가 맞지 않습니다");
+    const myFarm = state.farms.find((f) => f.ownerId === u.id);
+    // 기존 평문 비밀번호면 로그인 성공 시 해시로 자동 업그레이드 (본인 소유 농장 참여 비밀번호 포함)
+    const upgrade = isHashedPwd(u.pwd) ? null : await hashPwd(form.pwd);
+    update((s) => ({
+      ...s,
+      session: u.id,
+      activeFarmId: myFarm?.id || null,
+      users: upgrade ? s.users.map((x) => (x.id === u.id ? { ...x, pwd: upgrade } : x)) : s.users,
+      farms: upgrade ? s.farms.map((f) => (f.ownerId === u.id && f.joinPassword === form.pwd ? { ...f, joinPassword: upgrade } : f)) : s.farms,
+    }));
+  };
+
+  // 농장 코드 + 비밀번호로 바로 들어가기 (두 번째 사람, 회원가입 불필요)
+  const [joining, setJoining] = useState(false);
+  const doJoin = async () => {
+    const code = (form.joinCode || "").trim().toUpperCase();
+    const pwd = form.pwd;
+    if (!code || !pwd) return showToast("농장 코드와 비밀번호를 입력하세요");
+    if (!sync.isConfigured()) return showToast("이 기기에서는 인터넷 연결(배포된 주소)이 필요합니다");
+    setJoining(true);
+    showToast("농장을 불러오는 중…");
+    const payload = await sync.fetchByCode(code);
+    setJoining(false);
+    if (!payload || !payload.farm) return showToast("해당 농장 코드를 찾을 수 없습니다");
+    if (payload.farm.joinPassword && !(await verifyPwd(pwd, payload.farm.joinPassword))) {
+      return showToast("비밀번호가 맞지 않습니다");
+    }
+    // 로컬에 농장/하우스/기록을 복제하고 바로 로그인 + 동기화 켜기
+    const userId = uid();
+    const joinerPwdHash = await hashPwd(pwd);
+    update((s) => {
+      const farm = { ...payload.farm, ownerId: s.farms.find((f) => f.syncCode === code)?.ownerId || userId, syncCode: code };
+      const farmId = farm.id;
+      const remap = (arr) => (arr || []).map((x) => ({ ...x, farmId }));
+      // 이미 같은 농장이 있으면 병합, 없으면 추가
+      const exists = s.farms.some((f) => f.id === farmId);
+      const base = {
+        ...s,
+        users: [...s.users, { id: userId, name: "공동작업자", login: code + "-user", pwd: joinerPwdHash }],
+        session: userId,
+        activeFarmId: farmId,
+        farms: exists ? s.farms.map((f) => (f.id === farmId ? farm : f)) : [...s.farms, farm],
+        houses: [...s.houses.filter((h) => h.farmId !== farmId), ...remap(payload.houses)],
+        workLogs: [...s.workLogs.filter((w) => w.farmId !== farmId), ...remap(payload.workLogs)],
+        harvestLogs: [...s.harvestLogs.filter((h) => h.farmId !== farmId), ...remap(payload.harvestLogs)],
+        shipments: [...s.shipments.filter((x) => x.farmId !== farmId), ...remap(payload.shipments)],
+        photoLogs: [...(s.photoLogs || []).filter((x) => x.farmId !== farmId), ...remap(payload.photoLogs)],
+        destinations: [...(s.destinations || []).filter((x) => x.farmId !== farmId), ...remap(payload.destinations)],
+        boxTemplates: [...(s.boxTemplates || []).filter((x) => x.farmId !== farmId), ...remap(payload.boxTemplates)],
+        houseState: { ...s.houseState, ...(payload.houseState || {}) },
+      };
+      return base;
+    });
+    showToast("농장에 연결되었습니다 · 자동 동기화 켜짐");
+  };
+
+  return (
+    <div style={{ ...shell, justifyContent: "center", padding: "0 22px" }}>
+      <div style={{ textAlign: "center", marginBottom: 28 }}>
+        <div style={{ fontSize: 40, marginBottom: 8 }}>✿</div>
+        <div style={{ fontSize: 24, fontWeight: 800, letterSpacing: -0.5 }}>화훼 하우스 매니저</div>
+        <div style={{ color: T.sub, fontSize: 13, marginTop: 6 }}>
+          센서 없이도 매일 쓰는 하우스 관리
+        </div>
+      </div>
+
+      <div style={{ display: "flex", gap: 6, marginBottom: 18 }}>
+        <Chip active={mode === "login"} color={T.accent} onClick={() => setMode("login")} style={{ flex: 1, textAlign: "center", padding: "10px 4px", fontSize: 13 }}>
+          로그인
+        </Chip>
+        <Chip active={mode === "signup"} color={T.accent} onClick={() => setMode("signup")} style={{ flex: 1, textAlign: "center", padding: "10px 4px", fontSize: 13 }}>
+          회원가입
+        </Chip>
+        <Chip active={mode === "join"} color={T.ok} onClick={() => setMode("join")} style={{ flex: 1, textAlign: "center", padding: "10px 4px", fontSize: 13 }}>
+          농장 코드로
+        </Chip>
+      </div>
+
+      {mode === "join" ? (
+        <>
+          <div style={{ fontSize: 13, color: T.sub, lineHeight: 1.6, marginBottom: 14, background: T.panel2, borderRadius: 12, padding: 12 }}>
+            함께 쓰는 분에게 받은 <b style={{ color: T.ok }}>농장 코드</b>와 <b style={{ color: T.ok }}>비밀번호</b>만 입력하면 바로 같은 농장으로 들어갑니다. 회원가입은 필요 없어요.
+          </div>
+          <Field label="농장 코드">
+            <input style={inputStyle} value={form.joinCode || ""} onChange={set("joinCode")} placeholder="예: FARM-PLSLX" autoCapitalize="characters" />
+          </Field>
+          <Field label="비밀번호">
+            <input style={inputStyle} type="password" value={form.pwd} onChange={set("pwd")} placeholder="농장 만든 분과 같은 비밀번호" />
+          </Field>
+          <Btn kind="primary" onClick={doJoin} disabled={joining} style={{ width: "100%", marginTop: 6 }}>
+            {joining ? "불러오는 중…" : "농장으로 들어가기"}
+          </Btn>
+          <div style={{ color: T.faint, fontSize: 12.5, textAlign: "center", marginTop: 20, lineHeight: 1.6 }}>
+            농장 코드는 만든 분의 설정 → 자동 동기화에서 확인할 수 있습니다.
+          </div>
+        </>
+      ) : (
+        <>
+          {mode === "signup" && (
+            <Field label="이름"><input style={inputStyle} value={form.name} onChange={set("name")} placeholder="홍길동" /></Field>
+          )}
+          <Field label="아이디 (전화번호 또는 이메일)">
+            <input style={inputStyle} value={form.login} onChange={set("login")} placeholder="grower@farm.kr" />
+          </Field>
+          <Field label="비밀번호">
+            <input style={inputStyle} type="password" value={form.pwd} onChange={set("pwd")} placeholder="••••••" />
+          </Field>
+
+          {mode === "signup" && (
+            <>
+              <div style={{ height: 1, background: T.line, margin: "8px 0 16px" }} />
+              <div style={{ fontSize: 13, color: T.faint, marginBottom: 12 }}>농장 정보 (지금 건너뛰고 나중에 만들 수도 있어요)</div>
+              <Field label="농장명"><input style={inputStyle} value={form.farmName} onChange={set("farmName")} placeholder="햇살화훼농원" /></Field>
+              <Field label="지역"><input style={inputStyle} value={form.region} onChange={set("region")} placeholder="경기 고양" /></Field>
+              <Field label="하우스 수"><input style={inputStyle} type="number" value={form.houses} onChange={set("houses")} placeholder="12" /></Field>
+            </>
+          )}
+
+          <Btn kind="primary" onClick={mode === "signup" ? doSignup : doLogin} style={{ width: "100%", marginTop: 6 }}>
+            {mode === "signup" ? "가입하고 시작하기" : "로그인"}
+          </Btn>
+          <div style={{ color: T.faint, fontSize: 12.5, textAlign: "center", marginTop: 20, lineHeight: 1.6 }}>
+            {mode === "signup"
+              ? "가입하면 농장 코드가 자동으로 만들어집니다. 그 코드를 함께 쓰는 분에게 알려주세요."
+              : "이 기기에 저장된 계정으로 로그인합니다."}
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
+
+/* ============================ 농장 설정 화면 =========================== */
+function FarmSetupScreen({ state, update, user, showToast }) {
+  const [form, setForm] = useState({ name: "", region: "", houses: "" });
+  const set = (k) => (e) => setForm((f) => ({ ...f, [k]: e.target.value }));
+  const create = () => {
+    if (!form.name) return showToast("농장명을 입력하세요");
+    const farmId = uid();
+    const autoCode = "FARM-" + Math.random().toString(36).slice(2, 7).toUpperCase();
+    const n = Math.max(0, Math.min(60, parseInt(form.houses) || 0));
+    const houses = Array.from({ length: n }, (_, i) => ({
+      id: uid(), farmId, number: i + 1, name: `${i + 1}동`, flower: "", variety: "", color: "",
+      plantingDate: "", seedlingDate: "", expectedTotal: "", unit: "송이", lat: null, lng: null, qr: `FHM-${i + 1}`, memo: "",
+    }));
+    update((s) => ({
+      ...s,
+      farms: [...s.farms, { id: farmId, ownerId: user.id, name: form.name, region: form.region, lat: null, lng: null, memo: "", syncCode: autoCode, joinPassword: user.pwd || "" }],
+      activeFarmId: farmId,
+      houses: [...s.houses, ...houses],
+    }));
+    showToast("농장이 생성되었습니다");
+  };
+  return (
+    <div style={{ ...shell, justifyContent: "center", padding: "0 22px" }}>
+      <div style={{ fontSize: 22, fontWeight: 800, marginBottom: 6 }}>농장 만들기</div>
+      <div style={{ color: T.sub, fontSize: 13, marginBottom: 22 }}>
+        하우스 수를 입력하면 1동부터 자동으로 만들어집니다.
+      </div>
+      <Field label="농장명"><input style={inputStyle} value={form.name} onChange={set("name")} placeholder="햇살화훼농원" /></Field>
+      <Field label="지역"><input style={inputStyle} value={form.region} onChange={set("region")} placeholder="경기 고양" /></Field>
+      <Field label="하우스 수"><input style={inputStyle} type="number" value={form.houses} onChange={set("houses")} placeholder="12" /></Field>
+      <Btn kind="primary" onClick={create} style={{ width: "100%", marginTop: 6 }}>농장 생성</Btn>
+    </div>
+  );
+}
+
+/* ============================ 공용 헤더 ================================ */
+function ScreenHeader({ title, sub, right }) {
+  return (
+    <div style={{ padding: "18px 18px 12px", display: "flex", alignItems: "flex-end", justifyContent: "space-between" }}>
+      <div>
+        <div style={{ fontSize: 25, fontWeight: 800, letterSpacing: -0.5 }}>{title}</div>
+        {sub && <div style={{ color: T.sub, fontSize: 15, marginTop: 4, lineHeight: 1.5 }}>{sub}</div>}
+      </div>
+      {right}
+    </div>
+  );
+}
+
+/* ===================== 오늘 대시보드 + 아침 배너 ====================== */
+function TodayScreen({ state, farm, setTab, setDetailHouseId, update, weather, weatherLoading, weatherError }) {
+  const houses = state.houses.filter((h) => h.farmId === farm.id);
+  const ctx = { workLogs: state.workLogs, harvestLogs: state.harvestLogs, houseState: state.houseState, weatherHistory: state.weatherHistory, weather };
+
+  const rows = houses
+    .map((h) => ({ house: h, est: computeHouseEstimate(h, ctx) }))
+    .sort((a, b) => b.est.score - a.est.score);
+
+  // 아침 배너 요약 집계
+  const urgent = rows.filter((r) => r.est.status === "danger").length;
+  const cautionN = rows.filter((r) => r.est.status === "caution").length;
+  const needCut = rows.filter((r) => r.est.bloomInMin !== null && r.est.bloomInMin <= 1 && r.est.bloomInMax >= -7 && r.est.progress < 95).length;
+  const needPest = rows.filter((r) => r.est.pestAgo !== null && r.est.pestAgo >= 9).length;
+  const shipWaiting = state.shipments
+    .filter((s) => s.farmId === farm.id && s.status === "출하 대기")
+    .reduce((a, s) => a + (s.boxes || []).length, 0);
+
+  const [bannerOpen, setBannerOpen] = useState(true);
+  const [summaryHelp, setSummaryHelp] = useState(null);
+  const [bloomSchedule, setBloomSchedule] = useState(null);
+  const now = new Date();
+  const dateLabel = `${now.getFullYear()}년 ${now.getMonth() + 1}월 ${now.getDate()}일 ${["일","월","화","수","목","금","토"][now.getDay()]}요일`;
+
+  const houseNames = (matchedRows) => matchedRows.map((r) => r.house.name);
+  const summaryItems = [
+    {
+      key: "urgent",
+      n: urgent,
+      label: "긴급",
+      description: "지금 먼저 살펴보는 것이 좋은 하우스입니다.",
+      criteria: "날씨, 관수 간격, 환기 상태, 병해·화상 위험 등을 합산한 추정 위험점수가 76점 이상일 때 포함됩니다.",
+      matches: houseNames(rows.filter((r) => r.est.status === "danger")),
+    },
+    {
+      key: "caution",
+      n: cautionN,
+      label: "주의",
+      description: "오늘 상태를 확인하고 필요한 작업을 검토할 하우스입니다.",
+      criteria: "추정 위험점수가 51~75점일 때 포함됩니다. 긴급보다는 낮지만 관수·환기·병해 상태를 확인하는 것이 좋습니다.",
+      matches: houseNames(rows.filter((r) => r.est.status === "caution")),
+    },
+    {
+      key: "cut",
+      n: needCut,
+      label: "절화 필요",
+      description: "꽃을 자르거나 수확할 시기가 가까운 하우스입니다.",
+      criteria: "예상 개화일까지 1일 이하로 남았고, 현재 수확 진행률이 95% 미만일 때 포함됩니다.",
+      matches: houseNames(rows.filter((r) => r.est.bloomInMin !== null && r.est.bloomInMin <= 1 && r.est.bloomInMax >= -7 && r.est.progress < 95)),
+    },
+    {
+      key: "pest",
+      n: needPest,
+      label: "농약 확인",
+      description: "최근 방제 기록을 확인할 필요가 있는 하우스입니다.",
+      criteria: "마지막 농약 살포 기록으로부터 9일 이상 지났을 때 포함됩니다. 농약 기록이 한 번도 없는 하우스는 이 숫자에 포함되지 않습니다.",
+      matches: houseNames(rows.filter((r) => r.est.pestAgo !== null && r.est.pestAgo >= 9)),
+    },
+    {
+      key: "shipment",
+      n: shipWaiting,
+      label: "출하 대기",
+      suffix: "박스",
+      description: "포장을 마쳤어도 아직 농장에서 나가지 않은, 출하를 기다리는 박스 수입니다.",
+      criteria: "출하 기록의 상태가 ‘출하 대기’인 박스를 모두 합산합니다. (저장 시 포장 완료는 출하 대기·완료·보류 중 하나로 정해집니다.)",
+      matches: state.shipments
+        .filter((s) => s.farmId === farm.id && s.status === "출하 대기")
+        .map((s) => `${s.destination || "출하처 미입력"} · ${s.status} · ${(s.boxes || []).length}박스${s.scheduledDate ? ` · ${fmtDate(s.scheduledDate)} 예정` : ""}`),
+    },
+  ];
+
+  return (
+    <div>
+      <ScreenHeader title="오늘" sub={`${dateLabel} · ${nowHM()}`} />
+
+      {/* 아침 6시 오늘 할 일 상단 배너 */}
+      {state.settings.morningEnabled && (
+        <div style={{ padding: "0 14px 8px" }}>
+          <div style={{
+            background: `linear-gradient(135deg, ${T.accent}, #8E62B4)`,
+            color: T.accentInk, borderRadius: 16, padding: 16,
+          }}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+              <div style={{ fontWeight: 800, fontSize: 15 }}>
+                오늘 할 일 요약 <span style={{ opacity: .7, fontWeight: 600, fontSize: 12 }}>· {state.settings.morningTime} 기준</span>
+              </div>
+              <button onClick={() => setBannerOpen((o) => !o)}
+                style={{ background: "rgba(0,0,0,.18)", border: "none", color: T.accentInk, borderRadius: 8, padding: "4px 8px", fontWeight: 800, cursor: "pointer" }}>
+                {bannerOpen ? "접기" : "펼치기"}
+              </button>
+            </div>
+            {bannerOpen && (
+              <div style={{ marginTop: 12, display: "flex", flexWrap: "wrap", gap: 8 }}>
+                {summaryItems.map((item) => (
+                  <BannerPill
+                    key={item.key}
+                    n={item.n}
+                    label={item.label}
+                    suffix={item.suffix}
+                    onClick={() => setSummaryHelp(item)}
+                  />
+                ))}
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+
+      {summaryHelp && (
+        <Modal title={`${summaryHelp.label} · ${summaryHelp.n}${summaryHelp.n > 0 ? (summaryHelp.suffix || "건") : ""}`} onClose={() => setSummaryHelp(null)}>
+          <div style={{ color: T.ink, fontSize: 14, fontWeight: 700, lineHeight: 1.6, marginBottom: 10 }}>
+            {summaryHelp.description}
+          </div>
+          <div style={{ background: T.panel2, border: `1px solid ${T.line}`, borderRadius: 10, padding: 12, color: T.sub, fontSize: 13, lineHeight: 1.7 }}>
+            <b style={{ color: T.accent }}>포함 기준</b><br />
+            {summaryHelp.criteria}
+          </div>
+          <div style={{ marginTop: 14 }}>
+            <SectionTitle>{summaryHelp.key === "shipment" ? "현재 해당 출하 기록" : "현재 해당 하우스"}</SectionTitle>
+            {summaryHelp.matches.length > 0 ? (
+              <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+                {summaryHelp.matches.map((name, i) => (
+                  <div key={`${name}-${i}`} style={{ background: T.panel2, borderRadius: 8, padding: "9px 11px", color: T.ink, fontSize: 13 }}>
+                    {name}
+                  </div>
+                ))}
+              </div>
+            ) : (
+              <div style={{ color: T.faint, fontSize: 13, textAlign: "center", padding: "14px 0" }}>현재 해당 항목이 없습니다</div>
+            )}
+          </div>
+          <Btn kind="primary" onClick={() => setSummaryHelp(null)} style={{ width: "100%", marginTop: 16 }}>확인</Btn>
+        </Modal>
+      )}
+
+      {/* 날씨 */}
+      <div style={{ padding: "6px 14px 4px" }}>
+        <Card>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+            <div>
+              <div style={{ fontSize: 13, color: T.sub, display: "flex", alignItems: "center", gap: 6 }}>
+                {farm.region || "지역 미설정"} · {weather.sky}
+                {weather.source === "live" && (
+                  <span style={{ background: T.ok + "33", color: T.ok, fontSize: 10, fontWeight: 800, padding: "2px 6px", borderRadius: 6 }}>실시간</span>
+                )}
+                {weatherLoading && <span style={{ fontSize: 10, color: T.faint }}>불러오는 중…</span>}
+                {weather.source === "mock" && !weatherLoading && (
+                  <span style={{ background: T.faint + "33", color: T.faint, fontSize: 10, fontWeight: 800, padding: "2px 6px", borderRadius: 6 }}>추정</span>
+                )}
+              </div>
+              <div style={{ fontSize: 30, fontWeight: 800, marginTop: 2 }}>{weather.cur}℃</div>
+            </div>
+            <div style={{ textAlign: "right", fontSize: 13, color: T.sub, lineHeight: 1.7 }}>
+              <div>최고 {weather.high}℃ / 최저 {weather.low}℃</div>
+              <div>습도 {weather.humidity}% · 강수 {weather.rainProb}%</div>
+              <div>{weather.fog ? "🌫 안개 가능" : weather.heatRisk ? "🔥 고온 주의" : "양호"}</div>
+            </div>
+          </div>
+          {weather.source === "live" && weather.tomorrowHigh != null && (
+            <div style={{ marginTop: 10, paddingTop: 10, borderTop: `1px solid ${T.line}`, fontSize: 13, color: T.sub }}>
+              내일: {weather.tomorrowSky} · 최고 {weather.tomorrowHigh}℃ / 최저 {weather.tomorrowLow}℃
+            </div>
+          )}
+          {weather.source === "mock" && (
+            <div style={{ marginTop: 10, paddingTop: 10, borderTop: `1px solid ${T.line}`, fontSize: 12.5, color: T.faint, lineHeight: 1.5 }}>
+              {weatherError === "offline"
+                ? "인터넷 연결이 없어 추정 날씨를 표시 중입니다. 연결되면 자동으로 실시간 날씨로 바뀝니다."
+                : "설정 → 농장 위치를 등록하면 실시간 날씨로 바뀝니다."}
+            </div>
+          )}
+        </Card>
+      </div>
+
+      {/* 오늘 우선 작업 */}
+      <div style={{ padding: "10px 14px 4px" }}>
+        <SectionTitle>오늘 우선 작업</SectionTitle>
+        <Card style={{ padding: 14 }}>
+          {rows.slice(0, 5).map((r, i) => (
+            <div key={r.house.id} style={{ display: "flex", gap: 10, alignItems: "center", padding: "7px 0", borderBottom: i < 4 ? `1px solid ${T.line}` : "none" }}>
+              <span style={{ color: T.faint, fontWeight: 800, width: 16 }}>{i + 1}</span>
+              <StatusDot status={r.est.status} />
+              <span style={{ fontWeight: 700, width: 64 }}>{r.house.name}</span>
+              <span style={{ color: T.sub, fontSize: 13, flex: 1 }}>{r.est.recs[0]}</span>
+            </div>
+          ))}
+          {rows.length === 0 && <Empty text="하우스에 꽃을 등록하면 우선 작업이 표시됩니다" />}
+        </Card>
+      </div>
+
+      {/* 하우스별 상태 */}
+      <div style={{ padding: "12px 14px 4px" }}>
+        <SectionTitle>하우스별 상태</SectionTitle>
+        {rows.map((r) => (
+          <Card key={r.house.id} onClick={() => setDetailHouseId(r.house.id)} style={{ marginBottom: 10, cursor: "pointer" }}>
+            <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+              {r.est.active ? <StatusDot status={r.est.status} size={12} /> : <span style={{ width: 12, height: 12, borderRadius: "50%", border: `1.5px dashed ${T.faint}`, display: "inline-block" }} />}
+              <div style={{ fontWeight: 800, fontSize: 16 }}>{r.house.name}</div>
+              <div style={{ color: T.sub, fontSize: 14 }}>{r.house.flower || "꽃 미등록"}</div>
+              <div style={{ display: "flex", alignItems: "center", gap: 5, color: r.est.bloomEstimate ? "#EE9AC2" : T.faint, fontSize: 13, fontWeight: 700, whiteSpace: "nowrap" }}>
+                <span>🌸 {r.est.bloomEstimate ? `${r.est.bloomEstimate.round}차 예상 ${fmtDate(r.est.bloomEstimate.centerDate)}` : "개화예상 —"}</span>
+                {(r.est.bloomEstimates || []).length > 1 && (
+                  <button type="button" aria-label={`${r.house.name} 차수별 개화 일정 보기`}
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      setBloomSchedule({ house: r.house, current: r.est.bloomEstimate, estimates: r.est.bloomEstimates || [] });
+                    }}
+                    style={{ width: 28, height: 28, borderRadius: "50%", border: "1px solid #E78AB588", background: "#E78AB522", color: "#EE9AC2", padding: 0, cursor: "pointer", fontSize: 18, fontWeight: 900, lineHeight: "26px", flexShrink: 0 }}>+</button>
+                )}
+              </div>
+              <div style={{ marginLeft: "auto", fontSize: 13, fontWeight: 700, color: r.est.active ? STATUS[r.est.status].color : T.faint }}>
+                {r.est.active ? `${STATUS[r.est.status].label} ${r.est.score}` : "미시작"}
+              </div>
+            </div>
+            {r.est.active ? (
+              <div style={{ display: "flex", gap: 14, marginTop: 10, fontSize: 13.5, color: T.sub, flexWrap: "wrap" }}>
+                <span>💧 {r.est.waterAgo === null ? "기록없음" : daysAgoLabel(r.est.lastWaterTs)}</span>
+                <span>수확 {r.est.progress}%</span>
+                <span style={{ color: r.est.burn >= 50 ? T.danger : T.sub }}>화상위험도 {r.est.burn}%</span>
+                <span style={{ color: r.est.disease >= 55 ? T.caution : T.sub }}>병해위험도 {r.est.disease}%</span>
+              </div>
+            ) : (
+              <div style={{ marginTop: 8, fontSize: 13, color: T.faint }}>
+                아직 작업·꽃 등록이 없어 컨디션을 표시하지 않습니다. 꽃을 등록하거나 작업을 기록하면 시작됩니다.
+              </div>
+            )}
+          </Card>
+        ))}
+        {rows.length === 0 && (
+          <Card><Empty text="아직 하우스가 없습니다. 설정에서 하우스를 추가하세요." /></Card>
+        )}
+      </div>
+
+      <Note />
+      <div style={{ height: 20 }} />
+
+      {bloomSchedule && (
+        <Modal title={`${bloomSchedule.house.name} · 차수별 개화 일정`} onClose={() => setBloomSchedule(null)}>
+          <div style={{ fontSize: 13, color: T.sub, lineHeight: 1.6, marginBottom: 12 }}>
+            등록한 정식일 차수까지만 표시합니다. 현재 날짜가 중심 예상일을 지나면 오늘 화면은 다음 차수로 자동 변경됩니다.
+          </div>
+          {bloomSchedule.estimates.filter((est) => est.round > 1).map((est) => (
+            <div key={est.round} style={{
+              background: est.round === bloomSchedule.current.round ? "#E78AB51F" : T.panel2,
+              border: `1px solid ${est.round === bloomSchedule.current.round ? "#E78AB577" : T.line}`,
+              borderRadius: 12, padding: 12, marginBottom: 8,
+            }}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                <div style={{ fontWeight: 800, color: est.round === bloomSchedule.current.round ? "#E78AB5" : T.ink }}>{est.round}차</div>
+                {est.round === bloomSchedule.current.round && <span style={{ fontSize: 10, color: "#E78AB5", fontWeight: 800 }}>현재 표시</span>}
+              </div>
+              <div style={{ fontSize: 13, color: T.sub, marginTop: 6 }}>정식일 {fmtDateFull(est.plantingDate)}</div>
+              <div style={{ fontSize: 14, color: T.ink, fontWeight: 800, marginTop: 4 }}>🌸 개화 중심일 {fmtDateFull(est.centerDate)}</div>
+              <div style={{ fontSize: 13, color: T.sub, marginTop: 3 }}>예상 범위 {fmtDateFull(est.minDate)} ~ {fmtDateFull(est.maxDate)}</div>
+            </div>
+          ))}
+          <Btn kind="primary" onClick={() => setBloomSchedule(null)} style={{ width: "100%", marginTop: 8 }}>확인</Btn>
+        </Modal>
+      )}
+    </div>
+  );
+}
+
+function BannerPill({ n, label, suffix = "건", onClick }) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      aria-label={`${label} ${n}${n > 0 ? suffix : ""} 설명 보기`}
+      title={`${label} 설명 보기`}
+      style={{
+        background: "rgba(0,0,0,.18)", border: "1px solid rgba(0,0,0,.18)",
+        borderRadius: 12, padding: "10px 14px", minWidth: 72,
+        color: "inherit", textAlign: "left", cursor: "pointer", fontFamily: "inherit",
+      }}
+    >
+      <div style={{ fontSize: 26, fontWeight: 800, lineHeight: 1 }}>{n}</div>
+      <div style={{ fontSize: 13, marginTop: 4, opacity: .9, fontWeight: 700 }}>{label} {n > 0 ? suffix : ""}</div>
+      <div style={{ fontSize: 12.5, marginTop: 4, opacity: .7 }}>눌러서 설명</div>
+    </button>
+  );
+}
+
+function SectionTitle({ children }) {
+  return <div style={{ fontSize: 15, fontWeight: 800, color: T.sub, margin: "6px 2px 10px", letterSpacing: 0.2 }}>{children}</div>;
+}
+function Empty({ text }) {
+  return <div style={{ color: T.sub, fontSize: 15, textAlign: "center", padding: "22px 0", lineHeight: 1.6 }}>{text}</div>;
+}
+function Note() {
+  return (
+    <div style={{ padding: "14px 18px 0" }}>
+      <div style={{ fontSize: 13, color: T.sub, lineHeight: 1.7, borderTop: `1px solid ${T.line}`, paddingTop: 12 }}>
+        ⓘ {ESTIMATE_NOTE}
+      </div>
+    </div>
+  );
+}
+
+/* ============================ 빠른 작업 화면 =========================== */
+const WORK_BUTTONS = [
+  { key: "water", label: "물 줌", category: "watering", type: "관수", icon: "💧" },
+  { key: "vent_open", label: "개폐기 열기", category: "facility", type: "개폐기 열림", icon: "⬆" },
+  { key: "vent_close", label: "개폐기 닫기", category: "facility", type: "개폐기 닫힘", icon: "⬇" },
+  { key: "shade_on", label: "차광망 쳤음", category: "facility", type: "차광망 침", icon: "▦" },
+  { key: "shade_off", label: "차광망 걷음", category: "facility", type: "차광망 걷음", icon: "▢" },
+  { key: "pest", label: "농약 살포", category: "pesticide", type: "농약", icon: "🧪" },
+  { key: "photo", label: "사진 기록", category: "photo", type: "생육사진", icon: "📷" },
+  { key: "bloom", label: "꽃 피었음", category: "flowering", type: "개화", icon: "🌸" },
+  { key: "damage", label: "꽃 탐 발생", category: "damage", type: "꽃 탐", icon: "⚠" },
+  { key: "disease", label: "병해 의심", category: "disease_pest", type: "병해 의심", icon: "🔬" },
+  { key: "memo", label: "특이사항", category: "memo", type: "메모", icon: "✎" },
+];
+
+/* ---- 전체 재배 이력 카탈로그 (기획서 13번: 100여 종 작업) ---- */
+/* 각 항목: [작업명, 저장 카테고리]. needsDetail=true 인 카테고리는 상세 입력 모달을 띄움 */
+const HISTORY_CATALOG = [
+  {
+    group: "재배 준비",
+    cat: "preparation",
+    icon: "🚜",
+    items: ["밭 갈이", "로터리 작업", "두둑 만들기", "베드 정리", "배수로 정리", "흙 고르기",
+      "퇴비 살포", "기비 투입", "석회 살포", "토양개량제 투입", "토양소독", "멀칭 작업",
+      "관수라인 설치", "점적호스 설치", "지주대 설치", "말뚝 박기", "유인줄 설치", "네트망 설치",
+      "하우스 비닐 점검", "하우스 비닐 교체", "차광망 설치", "보온커튼 설치", "기타 재배 준비"],
+  },
+  {
+    group: "파종·묘종·정식",
+    cat: "planting",
+    icon: "🌱",
+    detail: true, // 수량/공급처 등 상세 입력
+    items: ["종자 파종", "묘종 입고", "묘종 확인", "가식", "정식", "보식", "결주 확인",
+      "활착 확인", "품종 변경", "작형 시작", "작형 종료", "기타 정식 관련"],
+  },
+  {
+    group: "생육 관리",
+    cat: "growth_management",
+    icon: "✂",
+    items: ["적심", "순지르기", "가지치기", "곁순 제거", "하엽 제거", "유인 작업", "줄기 묶기",
+      "꽃봉오리 정리", "꽃대 정리", "솎음 작업", "생육 불량주 제거", "죽은 포기 제거",
+      "키 조절 작업", "생장 조절제 처리", "생육 확인", "꽃봉오리 확인", "색 발현 시작",
+      "개화 시작 확인", "만개 확인", "기타 생육 관리"],
+  },
+  {
+    group: "관수·양분",
+    cat: "nutrient",
+    icon: "💧",
+    items: ["관수", "소량 관수", "충분히 관수", "관수 중단", "양액 공급", "액비 공급", "추비",
+      "엽면시비", "비료 살포", "물 부족 확인", "과습 확인", "배수 불량 확인", "기타 관수/양분"],
+  },
+  {
+    group: "시설·환경",
+    cat: "facility",
+    icon: "🏠",
+    items: ["개폐기 열기", "개폐기 닫기", "차광망 쳤음", "차광망 걷음", "보온커튼 닫음",
+      "보온커튼 열음", "환기함", "환기 못함", "난방 가동", "난방 중지", "냉방/팬 가동",
+      "냉방/팬 중지", "하우스 문 열기", "하우스 문 닫기", "강풍 대비 고정", "비닐 보수",
+      "누수 확인", "결로 확인", "기타 시설 관리"],
+  },
+  {
+    group: "병해충·농약",
+    cat: "disease_pest",
+    icon: "🔬",
+    items: ["병해 의심", "해충 발견", "응애 발견", "총채벌레 발견", "진딧물 발견", "흰가루병 의심",
+      "잿빛곰팡이 의심", "줄기썩음 의심", "뿌리썩음 의심", "반점 발생", "꽃잎 갈변", "꽃 탐 발생",
+      "약해 의심", "방제 확인", "방제 효과 있음", "방제 효과 부족", "기타 병해충 기록"],
+  },
+  {
+    group: "개화·절화·수확·출하",
+    cat: "flowering",
+    icon: "🌸",
+    items: ["꽃봉오리 확인", "색 발현 시작", "개화 시작", "만개", "절화 시작", "절화 완료",
+      "수확 시작", "수확 완료", "선별", "포장", "출하", "출하 보류", "상품성 낮음", "폐기",
+      "기타 수확/출하"],
+  },
+  {
+    group: "피해·이상",
+    cat: "damage",
+    icon: "⚠",
+    items: ["고온 피해", "저온 피해", "냉해", "꽃 탐", "잎 탐", "안개 피해 의심", "습해",
+      "과습 피해", "건조 피해", "물 부족", "약해", "병해 확산", "해충 확산", "강풍 피해",
+      "비닐 찢어짐", "누수", "정전", "작업 지연", "기타 피해"],
+  },
+];
+
+function QuickScreen({ state, update, farm, showToast, setDetailHouseId, weather }) {
+  const houses = state.houses.filter((h) => h.farmId === farm.id);
+  const ctx = { workLogs: state.workLogs, harvestLogs: state.harvestLogs, houseState: state.houseState, weatherHistory: state.weatherHistory, weather };
+  const [sel, setSel] = useState(() => (state.lastSelectedHouseId ? [state.lastSelectedHouseId] : []));
+  const [pestModal, setPestModal] = useState(null); // {houses}
+  const [memoModal, setMemoModal] = useState(null);
+  const [catalogModal, setCatalogModal] = useState(false);
+
+  const toggle = (id) => setSel((s) => (s.includes(id) ? s.filter((x) => x !== id) : [...s, id]));
+  const all = () => setSel(houses.map((h) => h.id));
+  const none = () => setSel([]);
+  const byRisk = () =>
+    setSel(houses.filter((h) => ["danger", "caution"].includes(computeHouseEstimate(h, ctx).status)).map((h) => h.id));
+  const byWater = () =>
+    setSel(houses.filter((h) => { const e = computeHouseEstimate(h, ctx); return e.waterAgo === null || e.waterAgo >= (FLOWER_PROFILES[h.flower]?.water || 2); }).map((h) => h.id));
+
+  const recordWork = (btn) => {
+    if (sel.length === 0) return showToast("하우스를 먼저 선택하세요");
+    if (btn.key === "pest") return setPestModal({ houses: [...sel] });
+    if (btn.key === "memo") return setMemoModal({ houses: [...sel] });
+
+    const ts = Date.now();
+    const logs = sel.map((houseId) => {
+      const h = houses.find((x) => x.id === houseId);
+      return {
+        id: uid(), farmId: farm.id, houseId, category: btn.category, type: btn.type,
+        name: btn.label, ts, flower: h?.flower || "", quantity: "", unit: "", detail: "", memo: "",
+      };
+    });
+    update((s) => {
+      const hsCopy = { ...s.houseState };
+      sel.forEach((id) => {
+        const cur = hsCopy[id] || { vent: "closed", shade: false };
+        if (btn.key === "vent_open") hsCopy[id] = { ...cur, vent: "open", updatedAt: ts };
+        if (btn.key === "vent_close") hsCopy[id] = { ...cur, vent: "closed", updatedAt: ts };
+        if (btn.key === "shade_on") hsCopy[id] = { ...cur, shade: true, updatedAt: ts };
+        if (btn.key === "shade_off") hsCopy[id] = { ...cur, shade: false, updatedAt: ts };
+      });
+      return { ...s, workLogs: [...logs, ...s.workLogs], houseState: hsCopy, lastSelectedHouseId: sel[sel.length - 1] };
+    });
+    showToast(`${sel.length}개 하우스 · ${btn.label} 기록됨`);
+  };
+
+  // 전체 재배 이력에서 작업명 선택 시 저장
+  const recordHistory = (cat, actionName, detail) => {
+    if (sel.length === 0) { showToast("하우스를 먼저 선택하세요"); return; }
+    const ts = Date.now();
+    const logs = sel.map((houseId) => {
+      const h = houses.find((x) => x.id === houseId);
+      return {
+        id: uid(), farmId: farm.id, houseId, category: cat, type: actionName,
+        name: actionName, ts, flower: h?.flower || "",
+        quantity: detail?.quantity || "", unit: detail?.unit || "",
+        detail: detail?.detail || "", memo: detail?.memo || "",
+      };
+    });
+    update((s) => {
+      const hsCopy = { ...s.houseState };
+      // 시설 작업이면 개폐기/차광망 상태도 갱신
+      sel.forEach((id) => {
+        const cur = hsCopy[id] || { vent: "closed", shade: false };
+        if (actionName === "개폐기 열기") hsCopy[id] = { ...cur, vent: "open", updatedAt: ts };
+        if (actionName === "개폐기 닫기") hsCopy[id] = { ...cur, vent: "closed", updatedAt: ts };
+        if (actionName === "차광망 쳤음") hsCopy[id] = { ...cur, shade: true, updatedAt: ts };
+        if (actionName === "차광망 걷음") hsCopy[id] = { ...cur, shade: false, updatedAt: ts };
+      });
+      return { ...s, workLogs: [...logs, ...s.workLogs], houseState: hsCopy, lastSelectedHouseId: sel[sel.length - 1] };
+    });
+    showToast(`${sel.length}개 하우스 · ${actionName} 기록됨`);
+  };
+
+  return (
+    <div>
+      <ScreenHeader title="빠른 작업" sub="하우스를 고르고 버튼 한 번이면 됩니다" />
+
+      {/* 빠른 선택 필터 */}
+      <div style={{ padding: "0 14px 8px", display: "flex", gap: 8, flexWrap: "wrap" }}>
+        <Chip onClick={all}>전체 선택</Chip>
+        <Chip onClick={none}>해제</Chip>
+        <Chip onClick={byRisk} color={T.caution}>위험 하우스만</Chip>
+        <Chip onClick={byWater} color={T.ok}>물 필요만</Chip>
+      </div>
+
+      {/* 하우스 체크 리스트 */}
+      <div style={{ padding: "0 14px" }}>
+        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
+          {houses.map((h) => {
+            const e = computeHouseEstimate(h, ctx);
+            const on = sel.includes(h.id);
+            return (
+              <button key={h.id} onClick={() => toggle(h.id)}
+                style={{
+                  textAlign: "left", background: on ? T.accent + "22" : T.panel,
+                  border: `1.5px solid ${on ? T.accent : T.line}`, borderRadius: 12, padding: "8px 10px", cursor: "pointer", color: T.ink,
+                }}>
+                <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                  <HouseShape number={h.number} status={e.status} flowerColor={colorHex(h.color)} width={52} open={(state.houseState[h.id] || {}).vent === "open"} beds={parseInt(h.bedCount) || 0} />
+                  <div style={{ flex: 1, minWidth: 0 }}>
+                    <div style={{ fontWeight: 800 }}>{h.name}</div>
+                    <div style={{ fontSize: 13, color: T.sub, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{h.flower || "미등록"}</div>
+                  </div>
+                  <span style={{ fontSize: 24, flexShrink: 0, color: on ? T.accent : T.faint }}>{on ? "☑" : "☐"}</span>
+                </div>
+              </button>
+            );
+          })}
+        </div>
+        {houses.length === 0 && <Card style={{ marginTop: 8 }}><Empty text="하우스를 먼저 추가하세요 (설정 탭)" /></Card>}
+      </div>
+
+      {/* 선택 상태 — 명확한 안내 */}
+      <div style={{ padding: "12px 14px 4px" }}>
+        {sel.length === 0 ? (
+          <div style={{ background: T.watch + "22", border: `1px solid ${T.watch}55`, borderRadius: 12, padding: "10px 14px", fontSize: 13, color: T.ink, fontWeight: 600 }}>
+            ⬆ 위에서 하우스를 먼저 고르세요. 그다음 아래 버튼을 누르면 기록됩니다.
+          </div>
+        ) : (
+          <div style={{ background: T.accent + "1A", border: `1px solid ${T.accent}55`, borderRadius: 12, padding: "10px 14px", fontSize: 13, color: T.ink }}>
+            <b style={{ color: T.accent }}>{sel.length}개 하우스</b> 선택됨 · 아래 버튼을 누르면 한 번에 기록됩니다
+          </div>
+        )}
+      </div>
+
+      {/* 작업 버튼 그리드 */}
+      <div style={{ padding: "8px 14px", display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10, opacity: sel.length === 0 ? 0.45 : 1 }}>
+        {WORK_BUTTONS.map((b) => (
+          <button key={b.key} onClick={() => recordWork(b)}
+            style={{
+              background: T.panel2, border: `1px solid ${T.line}`, borderRadius: 14,
+              padding: "18px 10px", cursor: "pointer", color: T.ink, fontWeight: 800, fontSize: 16,
+              minHeight: 84,
+              display: "flex", flexDirection: "column", alignItems: "center", gap: 8,
+            }}>
+            <span style={{ fontSize: 28 }}>{b.icon}</span>
+            {b.label}
+          </button>
+        ))}
+      </div>
+
+      {/* 전체 재배 이력 진입 */}
+      <div style={{ padding: "14px 14px 4px" }}>
+        <SectionTitle>전체 재배 이력</SectionTitle>
+        <button onClick={() => { if (sel.length === 0) { showToast("하우스를 먼저 선택하세요"); } else { setCatalogModal(true); } }}
+          style={{
+            width: "100%", background: T.panel2, border: `1px dashed ${T.line}`, borderRadius: 14,
+            padding: "16px", cursor: "pointer", color: T.ink, textAlign: "left",
+            display: "flex", alignItems: "center", gap: 12,
+          }}>
+          <span style={{ fontSize: 24 }}>📋</span>
+          <div>
+            <div style={{ fontWeight: 800, fontSize: 15 }}>밭갈이·말뚝·정식·적심 등 100여 종</div>
+            <div style={{ fontSize: 13, color: T.sub, marginTop: 2 }}>재배 준비부터 출하까지 모든 작업 기록</div>
+          </div>
+          <span style={{ marginLeft: "auto", color: T.accent, fontWeight: 800 }}>›</span>
+        </button>
+      </div>
+
+      <Note />
+      <div style={{ height: 20 }} />
+
+      {pestModal && (
+        <PesticideModal state={state} update={update} farm={farm} houses={houses}
+          targetHouses={pestModal.houses} onClose={() => setPestModal(null)} showToast={showToast} weather={weather} />
+      )}
+      {memoModal && (
+        <MemoModal update={update} farm={farm} houses={houses} targetHouses={memoModal.houses}
+          onClose={() => setMemoModal(null)} showToast={showToast} />
+      )}
+      {catalogModal && (
+        <HistoryCatalogModal selCount={sel.length} onClose={() => setCatalogModal(false)} onRecord={recordHistory} />
+      )}
+    </div>
+  );
+}
+
+/* --------- 농약 살포 모달 (입력 중 자동 임시저장 + 복구) ---------- */
+const PEST_TARGETS = ["응애", "총채벌레", "진딧물", "흰가루병", "잿빛곰팡이", "줄기썩음", "뿌리썩음", "기타"];
+const PEST_DIAGNOSES = [
+  { target: "응애", kind: "살비제", symptoms: ["잎 뒷면 작은 벌레", "거미줄", "잎 황화", "갈색 반점", "잎 마름"], note: "잎 뒷면을 확대해 움직이는 응애와 가는 거미줄을 확인하세요." },
+  { target: "총채벌레", kind: "살충제", symptoms: ["꽃잎 갈변", "꽃 탐", "은백색 상처", "꽃 변형", "작은 검은 벌레"], note: "꽃 속과 어린잎에서 가늘고 작은 벌레 또는 검은 배설물을 확인하세요." },
+  { target: "진딧물", kind: "살충제", symptoms: ["새순 벌레", "잎 말림", "끈적임", "감로", "그을음"], note: "새순과 잎 뒷면에 무리 지은 벌레와 끈적한 감로를 확인하세요." },
+  { target: "흰가루병", kind: "살균제", symptoms: ["흰 가루", "잎 표면 흰색", "분가루", "잎 오그라듦"], note: "잎과 줄기 표면에 닦이는 흰 가루 모양 균사가 있는지 확인하세요." },
+  { target: "잿빛곰팡이", kind: "살균제", symptoms: ["회색 곰팡이", "꽃잎 물러짐", "갈색 꽃잎", "습한 곰팡이", "회색 포자"], note: "습한 환경에서 꽃잎·줄기에 회색 솜털 같은 포자가 생기는지 확인하세요." },
+  { target: "줄기썩음", kind: "등록 살균제·토양관리", symptoms: ["줄기 물러짐", "줄기 갈변", "지제부 썩음", "포기 쓰러짐"], note: "지제부 줄기의 갈변·물러짐과 악취 여부를 확인하세요." },
+  { target: "뿌리썩음", kind: "등록 살균제·배수개선", symptoms: ["시듦", "뿌리 갈변", "뿌리 검음", "생육 불량", "과습"], note: "뿌리를 일부 확인해 흰 뿌리 감소, 갈변·검은색 변색이 있는지 살펴보세요." },
+];
+function searchPestDiagnoses(query) {
+  const q = (query || "").replace(/\s/g, "").toLowerCase();
+  if (!q) return [];
+  return PEST_DIAGNOSES.map((d) => {
+    const hay = `${d.target} ${d.kind} ${d.symptoms.join(" ")} ${d.note}`.replace(/\s/g, "").toLowerCase();
+    let score = hay.includes(q) ? 100 : 0;
+    for (const ch of new Set(q.split(""))) if (hay.includes(ch)) score += 1;
+    return { ...d, score };
+  }).filter((d) => d.score >= Math.max(2, q.length * 0.35)).sort((a, b) => b.score - a.score);
+}
+const PREVENTIVE_PEST_CYCLES = {
+  "총채벌레": { min: 12, max: 20, cue: "꽃·생장점 끈끈이트랩과 꽃 털기 조사", weather: "고온·건조할수록 세대가 빨라질 수 있음" },
+  "응애": { min: 8, max: 18, cue: "잎 뒷면과 하엽을 확대 관찰", weather: "고온·건조 조건에서 증가가 빨라질 수 있음" },
+  "진딧물": { min: 7, max: 14, cue: "새순·꽃봉오리와 유시충 유입 확인", weather: "온화한 시기와 새순 발생기에 주의" },
+  "나방류": { min: 18, max: 30, cue: "페로몬트랩·어린 유충·식흔 확인", weather: "첫 성충 포획일을 기준으로 현장 보정 필요" },
+  "가루이": { min: 18, max: 30, cue: "황색끈끈이트랩과 잎 뒷면 약충 확인", weather: "시설 내부 온도가 높으면 연중 발생 가능" },
+};
+function preventiveWindow(target, anchorDate) {
+  const key = Object.keys(PREVENTIVE_PEST_CYCLES).find((k) => String(target || "").includes(k));
+  const profile = key ? PREVENTIVE_PEST_CYCLES[key] : null;
+  if (!profile || !anchorDate) return null;
+  return {
+    key, ...profile,
+    start: addDaysISO(anchorDate, profile.min),
+    end: addDaysISO(anchorDate, profile.max),
+  };
+}
+const FLOWER_PREVENTION = {
+  장미: { source: "NCPMS", pests: ["노랑쐐기나방", "섬서구메뚜기", "장미흰깍지벌레", "파밤나방", "담배가루이", "온실가루이", "도둑나방", "미국흰불나방", "장미등에잎벌", "찔레수염진딧물", "꽃노랑총채벌레", "담배거세미나방", "점박이응애"], diseases: ["잿빛곰팡이병", "혹병", "흰가루병", "검은무늬병"], caution: "꽃잎과 신초에 약흔·약해가 나타날 수 있어 개화기에는 소면적 시험 후 처리" },
+  리시안셔스: {
+    source: "농사로·경상북도농업기술원·연구자료",
+    standardName: "리시안서스",
+    pests: ["작은뿌리파리", "뿌리혹선충"],
+    diseases: ["시들음병"],
+    caution: "리시안서스 전용 약해 자료는 제한적입니다. 꽃봉오리·절화 전에는 소면적 예비처리하고 고온·강광·과습, 임의 희석과 혼용을 피하세요.",
+    details: [
+      { type: "pest", name: "작은뿌리파리", stages: ["활착기", "영양생장기", "분지·신장기"], symptoms: "유충의 뿌리·지제부 가해로 뿌리 발달 불량, 생육 지연, 시들음과 고사가 나타나며 시들음병과 혼동될 수 있음", monitoring: "정식 직후부터 지표면 황색 끈끈이트랩, 과습 배지와 뿌리 주변의 유충·갈변·상처 확인", conditions: "시설 내 연중 발생 가능, 봄·가을과 20~25℃ 전후의 습하고 유기물이 많은 환경에서 증가", controlType: "살충제 또는 물리적·생물학적 방제" },
+      { type: "pest", name: "뿌리혹선충", stages: ["활착기", "영양생장기", "분지·신장기", "꽃봉오리 형성기"], symptoms: "뿌리 혹 형성으로 수분·양분 흡수가 저해되어 생육 불량, 시들음과 품질 저하 발생", monitoring: "이상 증상 발생 시 뿌리를 씻어 혹을 확인하고 토양 시료를 농업기술센터에 의뢰", conditions: "연작 시설재배지와 전작 선충 피해 토양, 정식 전 선충 밀도가 높은 포장에서 위험", controlType: "살선충제 또는 재배적·물리적 방제" },
+      { type: "disease", name: "시들음병", stages: ["활착기", "영양생장기", "분지·신장기", "꽃봉오리 형성기", "절화 전 품질관리기"], symptoms: "잎 시들음과 줄기 선단부 꺾임, 후기 도관부 이상·지제부 갈변·고사", monitoring: "정식 30일 이후 잎 시들음, 선단부 꺾임과 지제부 갈변을 조사하고 병든 주 발생을 기록", conditions: "고온기 정식 후 연작토양과 토양 중 Fusarium 밀도가 높은 조건에서 증가", controlType: "살균제 또는 재배적·물리적 방제" },
+    ],
+    generalPrevention: ["연작 이력과 전작 피해 기록", "정식 전 토양 증기·태양열 소독 등 비화학적 관리 검토", "배수 개선과 과습 방지", "병든 주와 뿌리 잔재물 즉시 반출", "시설 잡초·이끼·미숙 유기물 제거", "황색 끈끈이트랩 설치", "도구와 육묘상자 위생관리"],
+  },
+  국화: { source: "NCPMS", pests: ["온실가루이", "도롱이깍지벌레", "국화하늘소", "국화꼬마수염진딧물", "담배거세미나방", "아메리카잎굴파리", "꽃노랑총채벌레", "파밤나방", "목화진딧물", "점박이응애"], diseases: ["녹병", "흰녹병", "잿빛곰팡이병", "점무늬병", "국화줄기괴저바이러스병", "토마토반점위조바이러스병"], caution: "품종과 생육단계별 약해 차이가 있으므로 적용작물과 품종 주의사항 확인" },
+  거베라: { source: "NCPMS", pests: ["목화진딧물", "왕담배나방", "파총채벌레", "작은뿌리파리", "파밤나방", "온실가루이", "차먼지응애"], diseases: ["흰가루병", "점무늬병", "균핵병"], caution: "꽃 중심부에 약액이 고이지 않게 하고 개화 상태에서는 소면적 시험" },
+  카네이션: { source: "NCPMS", pests: ["파밤나방", "왕담배나방", "꽃노랑총채벌레", "점박이응애", "담배거세미나방"], diseases: ["시들음병", "검은무늬병", "모자이크병", "반점세균병", "녹병"], caution: "꽃잎 얼룩과 잎 약해 여부를 소면적에서 먼저 확인" },
+  백합: { source: "NCPMS", pests: ["목화진딧물", "명주달팽이", "뿌리응애"], diseases: ["줄기썩음병", "모자이크병"], caution: "바이러스 의심주는 약제보다 격리·제거를 우선하고 꽃봉오리 약흔에 주의" },
+  튤립: { source: "참고", pests: ["진딧물", "응애"], diseases: ["잿빛곰팡이병", "구근부패", "균핵병"], caution: "NCPMS 작물별 도감 미수록 참고값. 구근 처리와 지상부 등록을 구분" },
+  작약: { source: "NCPMS", pests: [], diseases: ["흰가루병", "점무늬병", "탄저병", "검은무늬병"], caution: "NCPMS 해충 검색 결과는 0건이며 꽃봉오리 약흔을 소면적 확인" },
+  해바라기: { source: "NCPMS", pests: [], diseases: ["검은무늬병", "녹병"], caution: "NCPMS 해충 검색 결과는 0건. 방문곤충 활동과 개화기 라벨 제한 확인" },
+  달리아: { source: "참고", pests: ["응애", "총채벌레", "진딧물"], diseases: ["흰가루병", "잿빛곰팡이병", "바이러스 의심"], caution: "NCPMS 작물별 도감 미수록 참고값. 바이러스 의심주는 격리" },
+  수국: { source: "NCPMS", pests: ["차응애", "대만총채벌레"], diseases: ["흰가루병", "잿빛곰팡이병"], caution: "잎·꽃받침 변색 가능성이 있어 품종별 소면적 시험" },
+  안개초: { source: "NCPMS", pests: ["파밤나방", "점박이응애", "왕담배나방", "복숭아혹진딧물", "아메리카잎굴파리"], diseases: ["흰가루병", "시들음병"], caution: "가는 잎과 어린 조직의 약해를 소면적에서 확인" },
+  금어초: { source: "NCPMS", pests: [], diseases: ["검은무늬병", "잿빛곰팡이병", "균핵병"], caution: "NCPMS 해충 검색 결과는 0건이며 꽃대와 꽃잎 약흔을 확인" },
+  라넌큘러스: { source: "참고", pests: ["진딧물", "총채벌레", "응애"], diseases: ["잿빛곰팡이병", "흰가루병", "뿌리썩음"], caution: "NCPMS 작물별 도감 미수록 참고값. 연한 조직 약해를 시험" },
+  프리지아: { source: "참고", pests: ["총채벌레", "진딧물", "응애"], diseases: ["구근부패", "잿빛곰팡이병", "시들음병"], caution: "NCPMS 작물별 도감 미수록 참고값. 개화기 라벨 제한 확인" },
+  스토크: { source: "NCPMS", pests: [], diseases: ["균핵병"], caution: "NCPMS 해충 검색 결과는 0건이며 꽃대 약흔을 소면적 확인" },
+  스타티스: { source: "NCPMS", pests: [], diseases: ["검은줄기썩음병", "흰가루병"], caution: "NCPMS 해충 검색 결과는 0건이며 꽃받침 변색을 소면적 확인" },
+  아네모네: { source: "참고", pests: ["진딧물", "총채벌레", "응애"], diseases: ["잿빛곰팡이병", "뿌리썩음", "균핵병"], caution: "NCPMS 작물별 도감 미수록 참고값. 꽃잎 약흔을 소면적 시험" },
+  글라디올러스: { source: "NCPMS", pests: ["담배거세미나방"], diseases: ["모자이크병", "목썩음병", "마른썩음병"], caution: "구근 처리와 지상부 살포의 등록 용도를 구분" },
+  기타: { source: "참고", pests: ["총채벌레", "응애", "진딧물", "가루이"], diseases: ["잿빛곰팡이병", "흰가루병", "뿌리썩음"], caution: "NCPMS 전용 작물 자료 없음. 정확한 꽃 이름과 등록 여부 확인" },
+};
+FLOWER_PREVENTION.리시안셔스 = {
+  source: "농사로·농촌진흥청·국내외 학술자료",
+  sourceStatus: "NCPMS 작목별 도감에서 리시안서스 또는 꽃도라지 작물명 수록은 확인되지 않음. 농사로 공식자료, 농촌진흥청 자료, PSIS 확인용 시스템, 국내외 학술자료에서 리시안서스·꽃도라지 적용이 직접 확인된 병해충만 포함",
+  ncpmsCropName: "미수록",
+  standardName: "리시안서스",
+  aliases: ["리시안셔스", "리시안사스", "리시안시스", "꽃도라지", "Lisianthus", "Eustoma", "Eustoma grandiflorum", "Eustoma grandiflorum (Raf.) Shinn.", "Eustoma russellianum", "Russell prairie gentian", "Texas bluebell"],
+  pests: ["작은뿌리파리", "뿌리혹선충"],
+  diseases: ["시들음병(Fusarium oxysporum)", "뿌리썩음병(Pythium spinosum)", "뿌리썩음병(Fusarium solani)", "잎썩음병(Rhizoctonia solani)", "균핵병(Sclerotinia sclerotiorum)", "잿빛곰팡이병(Botrytis cinerea)", "바이러스병(BBWV)", "오이모자이크바이러스병(CMV)", "토마토황화잎말림바이러스병(TYLCV)", "토마토반점위조바이러스병(TSWV)", "봉선화괴저반점바이러스병(INSV)", "점무늬병(Pseudocercospora eustomatis)"],
+  caution: "리시안서스 전용 약해 자료는 제한적으로 확인된다. 농약 사용 전 PSIS에서 리시안서스 또는 꽃도라지에 등록된 작물명, 대상 병해충, 사용시기, 안전사용기준을 확인해야 한다. 꽃봉오리 형성기와 절화 전 품질관리기에는 꽃잎 반점, 변색, 잎끝 손상 가능성을 고려해 소면적 예비처리 후 사용하고, 고온·강광·과습 상태, 임의 혼용, 임의 희석배수 사용은 피한다.",
+  details: [
+    { type: "pest", name: "작은뿌리파리", stages: ["활착기", "영양생장기", "분지·신장기", "꽃봉오리 형성기"], symptoms: "리시안서스 연작재배지에서 피해가 큰 토양 해충으로 확인된다. 유충이 뿌리와 지제부 주변을 가해하여 활착 불량, 생육 지연, 시들음, 고사 증상과 혼동되는 피해를 일으킬 수 있다.", monitoring: "정식 직후부터 지표면 가까이에 황색 끈끈이트랩을 설치해 성충 발생을 확인하고, 시드는 포기는 뿌리와 지제부 주변을 파서 유충·뿌리 상처·부패 여부를 확인한다.", conditions: "시설 내 어둡고 습한 환경, 과습한 상토·배지, 잡초와 유기물이 많은 포장에서 증가하기 쉽다. 20~25℃ 전후 시설하우스에서 발생이 쉬우며 봄·가을에 밀도가 높아질 수 있다.", controlType: "살충제 또는 물리적·생물학적 방제", sourceUrl: "https://www.nongsaro.go.kr/portal/ps/pss/pssa/hlsctSearchDtl.ps?hlsctCode=H00000602&menuId=PS00403", lifeCycle: { kind: "fungusGnat", overwintering: "시설 내 연중 발생 가능", generations: "25℃에서 알 4일·유충 14일·번데기 4일, 알부터 성충까지 약 22일. 6월 하순~8월 하순에는 약 15일", adultLife: "약 7~10일", eggLaying: "습한 토양 표면과 고인 물에 2~10개씩 산란, 암컷당 약 100~300개", sourceUrl: "https://www.nongsaro.go.kr/portal/ps/pss/pssa/hlsctSearchDtl.ps?hlsctCode=H00000602&menuId=PS00403" } },
+    { type: "pest", name: "뿌리혹선충", stages: ["활착기", "영양생장기", "분지·신장기", "꽃봉오리 형성기", "절화 전 품질관리기"], symptoms: "리시안서스 연작재배지에서 피해가 큰 토양 병해충으로 확인된다. 뿌리에 혹이 생기면 수분·양분 흡수가 저해되어 생육 부진, 시들음, 절화 품질 저하가 나타날 수 있다.", monitoring: "생육이 불량하거나 시드는 포기의 뿌리를 캐서 혹 형성 여부를 확인하고, 정식 전 또는 재배 종료 후 토양·뿌리 시료를 농업기술센터나 전문기관에 의뢰해 선충 밀도를 확인한다.", conditions: "연작 시설재배지, 전작에서 선충 피해가 있었던 포장, 토양 내 선충 밀도가 높은 정식 예정지에서 문제가 되기 쉽다.", controlType: "살선충제 또는 재배적·물리적 방제", sourceUrl: "https://www.dbpia.co.kr/journal/articleDetail?nodeId=NODE11033668" },
+    { type: "disease", name: "시들음병(Fusarium oxysporum)", stages: ["활착기", "영양생장기", "분지·신장기", "꽃봉오리 형성기", "절화 전 품질관리기"], symptoms: "발병 초기에는 잎 시들음과 줄기 선단부 꺾임이 나타나고, 후기에는 도관부 구멍, 지제부 줄기 갈변, 고사 증상이 나타난다.", monitoring: "정식 30일 이후부터 시드는 포기, 줄기 선단부 꺾임, 지제부 갈변을 확인한다. 연작지에서는 토양 중 Fusarium sp. 밀도와 병든 주 발생 여부를 함께 확인한다.", conditions: "8~9월 고온기 정식 후 10월부터 이듬해 2월까지 주로 발병이 보고되며, 24℃ 이상 고온다습 환경과 연작토양에서 증가한다. 농사로 자료에서는 토양 중 Fusarium sp. 농도 1x10^4 이상에서 발병이 관찰되었다.", controlType: "현장 진단 후 등록 살균제 라벨 확인 또는 윤작, 객토, 토양소독, 배수 개선, 뿌리 상처 방지와 병든 포기 제거", sourceUrl: "https://nongsaro.go.kr/portal/ps/psb/psbb/farmUseTechDtl.ps?farmPrcuseSeqNo=100000161151&menuId=PS00072&totalSearchYn=Y", imageUrl: "", imageSourceUrl: "", imageDescription: "직접 열리는 검증된 리시안서스 시들음병 사진 주소를 확인하지 못함" },
+    { type: "disease", name: "뿌리썩음병(Pythium spinosum)", stages: ["활착기", "영양생장기", "분지·신장기"], symptoms: "Pythium spinosum Sawada에 의한 꽃도라지 뿌리썩음병으로 보고되었다. 공개 자료에서는 Fusarium oxysporum f. sp. eustomae에 의한 시들음병과 구분되는 뿌리썩음병으로 제시되어 있다.", monitoring: "활착 불량, 생육 부진, 시들음 증상이 있는 포기의 뿌리 부패 여부를 확인하고, 병원균 확인은 전문기관에 진단을 의뢰한다.", conditions: "리시안서스 기준 세부 발생 온도·습도는 공개 초록에서 확인되지 않는다. 일반적으로 뿌리썩음병은 과습, 배수 불량, 뿌리 스트레스가 있는 포장에서 주의가 필요하다.", controlType: "살균제 또는 재배적·물리적 방제", sourceUrl: "https://www.ppjonline.org/upload/pdf/PPJ014-02-01.pdf" },
+    { type: "disease", name: "뿌리썩음병(Fusarium solani)", stages: ["활착기", "영양생장기", "분지·신장기", "꽃봉오리 형성기"], symptoms: "2015년 경기도 여주와 경남 김해 지역에서 꽃도라지가 시들고 지제부가 잘록해지면서 위축되고 뿌리가 썩는 증상으로 보고되었다. 병든 식물체는 황화, 뿌리 발육 저해, 전신 황화·시들음·위축 후 고사할 수 있다.", monitoring: "시드는 포기와 황화 포기를 뽑아 지제부 협착, 뿌리 부패, 뿌리 발육 저해를 확인하고 병원균 동정은 전문기관에 의뢰한다.", conditions: "리시안서스 기준 세부 온도·습도 조건은 공개 초록에서 확인되지 않는다. 병든 뿌리와 지제부 잔재물, 연작 토양, 배수 불량 포장에서 주의가 필요하다.", controlType: "살균제 또는 재배적·물리적 방제", sourceUrl: "https://scienceon.kisti.re.kr/srch/selectPORSrchArticle.do?cn=JAKO201714563376829" },
+    { type: "disease", name: "잎썩음병(Rhizoctonia solani)", stages: ["영양생장기", "분지·신장기", "꽃봉오리 형성기", "절화 전 품질관리기"], symptoms: "국내 꽃도라지에 발생하는 병으로 Rhizoctonia solani에 의한 잎썩음병이 보고되어 있다. 리시안서스 기준 세부 병징은 공개 초록에서 충분히 확인되지 않는다.", monitoring: "잎과 지제부에 썩음, 갈변, 생육 불량이 보이는 포기를 확인하고, Rhizoctonia solani 확인은 병든 조직을 전문기관에 의뢰한다.", conditions: "리시안서스 기준 세부 온도·습도 조건은 공개 자료에서 확인되지 않는다. 일반적으로 시설 내 과습, 통풍 불량, 병든 잔재물 존재 시 주의가 필요하다.", controlType: "살균제 또는 재배적·물리적 방제", sourceUrl: "https://scienceon.kisti.re.kr/srch/selectPORSrchArticle.do?cn=JAKO201714563376829" },
+    { type: "disease", name: "균핵병(Sclerotinia sclerotiorum)", stages: ["영양생장기", "분지·신장기", "꽃봉오리 형성기", "절화 전 품질관리기"], symptoms: "강원도 고랭지 주요 원예작물 병해 발생 조사에서 꽃도라지의 균핵병으로 보고되었다. 리시안서스 기준 세부 병징은 공개 초록에서 충분히 확인되지 않는다.", monitoring: "줄기, 잎, 지제부에 물러짐·갈변·흰 균사·균핵 의심 증상이 있는지 확인하고, 병든 조직은 전문기관에 진단 의뢰한다.", conditions: "리시안서스 기준 세부 온도·습도 조건은 공개 자료에서 확인되지 않는다. 시설 내 저온다습, 통풍 불량, 병든 잔재물 축적 조건에서 주의가 필요하다.", controlType: "살균제 또는 재배적·물리적 방제", sourceUrl: "https://koreascience.kr/article/JAKO199811920118855.pub?lang=ko" },
+    { type: "disease", name: "잿빛곰팡이병(Botrytis cinerea)", stages: ["분지·신장기", "꽃봉오리 형성기", "절화 전 품질관리기"], symptoms: "강원도 고랭지 주요 원예작물 병해 발생 조사에서 꽃도라지의 잿빛곰팡이병으로 보고되었다. 리시안서스 기준 세부 병징은 공개 초록에서 충분히 확인되지 않는다.", monitoring: "꽃봉오리, 꽃잎, 잎끝, 줄기 상처 부위에 갈변, 물러짐, 회색 곰팡이 포자 형성 여부를 확인한다.", conditions: "리시안서스 기준 세부 조건은 공개 자료에서 확인되지 않는다. 시설하우스의 저온다습, 환기 부족, 야간 습도 상승, 식물체 표면 결로 조건에서 주의가 필요하다.", controlType: "살균제 또는 재배적·물리적 방제", sourceUrl: "https://koreascience.kr/article/JAKO199811920118855.pub?lang=ko" },
+    { type: "disease", name: "바이러스병(BBWV)", stages: ["활착기", "영양생장기", "분지·신장기", "꽃봉오리 형성기", "절화 전 품질관리기"], symptoms: "강원도 고랭지 주요 원예작물 병해 발생 조사에서 꽃도라지의 바이러스병으로 BBWV가 보고되었다. 리시안서스 기준 세부 병징은 공개 초록에서 충분히 확인되지 않는다.", monitoring: "모자이크, 황화, 위축, 괴사, 생육 이상 등 바이러스 의심 증상이 있는 포기를 표시하고 농업기술센터 또는 전문기관에 진단을 의뢰한다.", conditions: "리시안서스 기준 세부 발생 조건은 공개 자료에서 확인되지 않는다. 감염주, 주변 기주식물, 매개충 존재 시 확산 위험이 있다.", controlType: "재배적·물리적 방제 및 매개충 관리", sourceUrl: "https://koreascience.kr/article/JAKO199811920118855.pub?lang=ko" },
+    { type: "disease", name: "오이모자이크바이러스병(CMV)", stages: ["활착기", "영양생장기", "분지·신장기", "꽃봉오리 형성기", "절화 전 품질관리기"], symptoms: "강원도 고랭지 주요 원예작물 병해 발생 조사에서 꽃도라지의 바이러스병으로 CMV가 보고되었다. 리시안서스 기준 세부 병징은 공개 초록에서 충분히 확인되지 않는다.", monitoring: "모자이크, 황화, 잎 변형, 위축, 생육 이상 등 바이러스 의심 증상이 있는 포기를 표시하고 진단키트 또는 전문기관 진단을 활용한다.", conditions: "리시안서스 기준 세부 발생 조건은 공개 자료에서 확인되지 않는다. 감염주, 주변 잡초·기주식물, 매개충 존재 시 확산 위험이 있다.", controlType: "재배적·물리적 방제 및 매개충 관리", sourceUrl: "https://koreascience.kr/article/JAKO199811920118855.pub?lang=ko" },
+    { type: "disease", name: "토마토황화잎말림바이러스병(TYLCV)", stages: ["활착기", "영양생장기", "분지·신장기", "꽃봉오리 형성기", "절화 전 품질관리기"], symptoms: "국내 Eustoma grandiflorum에서 Tomato yellow leaf curl virus 감염이 최초 보고되었다. 리시안서스 기준 세부 병징은 공개 초록에서 충분히 확인되지 않는다.", monitoring: "황화, 잎 말림, 생육 위축, 바이러스 의심 증상이 있는 포기를 표시하고 PCR 등 전문 진단을 의뢰한다. 시설 내 가루이류 발생 여부를 끈끈이트랩으로 함께 확인한다.", conditions: "리시안서스 기준 세부 발생 조건은 공개 자료에서 확인되지 않는다. 감염주와 매개충이 함께 존재하는 시설재배 환경에서 확산 위험이 있다.", controlType: "재배적·물리적 방제 및 매개충 관리", sourceUrl: "https://pubmed.ncbi.nlm.nih.gov/30708805/" },
+    { type: "disease", name: "토마토반점위조바이러스병(TSWV)", stages: ["활착기", "영양생장기", "분지·신장기", "꽃봉오리 형성기", "절화 전 품질관리기"], symptoms: "국내 Eustoma grandiflorum에서 Tomato spotted wilt virus 감염이 최초 보고되었다. 리시안서스 기준 세부 병징은 공개 초록에서 충분히 확인되지 않는다.", monitoring: "반점, 괴저, 황화, 잎·줄기 이상, 생육 저하 등 바이러스 의심 증상이 있는 포기를 표시하고 전문기관 진단을 의뢰한다. 총채벌레류 발생 여부를 청색 또는 황색 끈끈이트랩으로 확인한다.", conditions: "리시안서스 기준 세부 발생 조건은 공개 자료에서 확인되지 않는다. 총채벌레류 매개충, 주변 감염 기주식물, 시설 내 연중 재배 조건에서 확산 위험이 있다.", controlType: "재배적·물리적 방제 및 매개충 관리", sourceUrl: "https://apsjournals.apsnet.org/doi/10.1094/PDIS-10-16-1514-PDN" },
+    { type: "disease", name: "봉선화괴저반점바이러스병(INSV)", stages: ["활착기", "영양생장기", "분지·신장기", "꽃봉오리 형성기", "절화 전 품질관리기"], symptoms: "2024년 경남 김해 시설재배 리시안서스에서 동심원형 퇴록 반점, 황화, 괴사 등 바이러스 유사 증상이 나타난 식물체에서 Impatiens necrotic spot virus 감염이 국내 최초 보고되었다.", monitoring: "동심원형 퇴록 반점, 황화, 괴사, 생육 이상이 있는 포기를 표시하고 RT-PCR 등 전문 진단을 의뢰한다. 총채벌레류 매개충 발생 여부를 끈끈이트랩으로 확인한다.", conditions: "리시안서스 기준 세부 온도·습도 조건은 공개 자료에서 확인되지 않는다. 감염주, 총채벌레류 매개충, 시설 내 기주식물 존재 시 확산 위험이 있다.", controlType: "재배적·물리적 방제 및 매개충 관리", sourceUrl: "https://apsjournals.apsnet.org/doi/10.1094/PDIS-05-25-1101-PDN" },
+    { type: "disease", name: "점무늬병(Pseudocercospora eustomatis)", stages: ["영양생장기", "분지·신장기", "꽃봉오리 형성기", "절화 전 품질관리기"], symptoms: "2023년 12월 김해시 재배 리시안셔스 잎에서 어둡게 변색되고 시드는 병징이 발견되었고, Pseudocercospora eustomatis에 의한 리시안셔스 점무늬병으로 국내 최초 보고되었다.", monitoring: "잎의 어두운 변색, 점무늬, 시듦 증상이 있는 포기를 관찰하고 병든 잎을 채취해 전문기관에 병원균 동정을 의뢰한다.", conditions: "리시안서스 기준 세부 온도·습도 조건은 공개 초록에서 확인되지 않는다. 병든 잎 잔재물, 잎 표면 습윤, 통풍 불량 조건에서 주의가 필요하다.", controlType: "살균제 또는 재배적·물리적 방제", sourceUrl: "https://www.kci.go.kr/kciportal/ci/sereArticleSearch/ciSereArtiView.kci?sereArticleSearchBean.artiId=ART003199138" },
+  ],
+  generalPrevention: [
+    "정식 전 연작 이력, 전작의 시들음병·뿌리썩음병·선충·작은뿌리파리 피해 여부를 기록한다.",
+    "연작 포장은 정식 전 토양 증기소독, 태양열소독, 휴경기 토양관리 등 비화학적 토양 병해충 저감 방법을 검토한다.",
+    "배수 불량과 과습을 줄이고 관수 후 지표면과 잎 표면이 장시간 젖어 있지 않도록 관리한다.",
+    "병든 주, 병든 잎, 뿌리 잔재물은 즉시 제거해 포장 밖으로 반출한다.",
+    "모종 정식 시 뿌리 상처를 줄이고 활착기 스트레스를 낮춘다.",
+    "시설 내부 잡초, 이끼, 부숙되지 않은 유기물, 과습한 배지를 줄여 작은뿌리파리와 바이러스 매개충 서식 환경을 줄인다.",
+    "황색·청색 끈끈이트랩을 설치해 작은뿌리파리, 총채벌레류, 가루이류 등 시설 미소해충 발생을 조기 확인한다.",
+    "출입구 방충망, 작업자 동선 관리, 육묘장 위생관리로 외부 해충과 감염주 유입을 줄인다.",
+    "바이러스 의심주는 즉시 표시하고 작업 순서를 뒤로 미루며, 진단 전까지 정상주와 접촉을 줄인다.",
+    "작업도구, 육묘 상자, 절화 도구를 청결하게 관리하고 병든 구역 작업 후 정상 구역으로 이동하지 않는다.",
+    "농약을 사용할 경우 농약 상품명이나 희석배수를 임의로 정하지 말고 PSIS에서 등록 작물·대상 병해충·사용기준을 확인한다.",
+  ],
+};
+FLOWER_PREVENTION.안개초 = {
+  source: "NCPMS·농사로·농촌진흥청·국내 학술자료",
+  sourceStatus: "NCPMS 작목별 병해충 정보에서 안개꽃 작물명 수록 확인. 안개꽃·안개초·Gypsophila paniculata와 직접 관련이 확인된 병해충만 포함",
+  ncpmsCropName: "안개꽃",
+  standardName: "안개초",
+  aliases: ["안개꽃", "숙근안개초", "지프소필라", "Gypsophila", "baby's breath", "Gypsophila paniculata", "Gypsophila paniculata L."],
+  pests: ["왕담배나방", "파밤나방", "아메리카잎굴파리", "점박이응애", "복숭아혹진딧물", "총채벌레류"],
+  diseases: ["역병", "흰가루병(Erysiphe buhrii)", "시들음병(Fusarium wilt)", "관부썩음병(Fusarium proliferatum)", "잿빛곰팡이병(Botrytis cinerea)", "균핵병(Sclerotinia sclerotiorum)", "오이모자이크바이러스병(CMV)"],
+  caution: "안개꽃·안개초에 농약을 사용할 때는 현장에서 병해충을 먼저 확인하고 PSIS에서 등록 작물명, 대상 병해충, 사용시기, 사용횟수, 안전사용기준과 약해 주의사항을 확인한다. 제품명·희석배수·혼용법은 공식 등록정보와 제품 라벨 확인 없이 임의 적용하지 않는다. 꽃봉오리 형성기와 절화 전에는 꽃잎 반점·변색·잎끝 손상 가능성을 고려해 고온·강광·과습·건조 스트레스 상태의 처리를 피하고 필요 시 소면적 예비 확인 후 사용한다.",
+  details: [
+    {
+      type: "pest", name: "왕담배나방", stages: ["영양생장기", "분지·신장기", "꽃봉오리 형성기", "절화 전 품질관리기"],
+      symptoms: "유충이 새잎, 신초, 꽃봉오리와 꽃을 갉아먹어 구멍, 식흔과 배설물을 남긴다. 꽃봉오리 내부 가해는 절화 품질을 크게 낮추며 유충이 조직 안으로 들어가면 확인과 방제가 어려워진다.",
+      monitoring: "시설 내부와 주변에 페로몬트랩 또는 유아등을 설치해 성충 발생을 확인한다. 적심한 신초, 새잎, 꽃봉오리와 절화 예정 꽃을 직접 확인하고, 피해가 의심되는 봉오리는 내부를 벌려 어린 유충, 식흔과 배설물을 확인한다.",
+      conditions: "NCPMS·농사로 자료에서 연 2~3세대 발생하고 번데기로 토양에서 월동하며 5~6월 성충 우화 후 10월까지 피해를 주는 것으로 제시된다. 알은 약 3~4일 후 부화하고 산란부터 우화까지 약 17~20일, 성충 수명은 10~12일이다. 안개꽃 기준 발생 적온·습도·강우 숫자는 공식 공개자료에서 확인되지 않았다.",
+      controlType: "현장 예찰 후 등록 살충제 라벨 확인 또는 페로몬트랩, 방충망, 적심 잔재물·피해 꽃봉오리 제거, 어린 유충 포살",
+      sourceUrl: "https://www.nongsaro.go.kr/portal/ps/pss/pssa/insectSearchDtl.ps?menuId=PS00404&spcsCode=ZR1DS0056", imageUrl: "", imageSourceUrl: "", imageDescription: "직접 열리는 검증된 안개꽃 피해 사진 주소를 확인하지 못함",
+      lifeCycle: { kind: "cornEarworm", overwintering: "땅속에서 번데기로 월동", generations: "연 2~3세대, 알부터 우화까지 약 17~20일", adultLife: "약 10~12일", eggLaying: "5~6월 우화 후 새잎·신초에 산란, 산란 후 약 3~4일에 부화", activeSeason: "5~6월 우화 후 10월까지 피해", sourceUrl: "https://www.nongsaro.go.kr/portal/ps/pss/pssa/insectSearchDtl.ps?menuId=PS00404&spcsCode=ZR1DS0056" },
+    },
+    {
+      type: "pest", name: "파밤나방", stages: ["활착기", "영양생장기", "분지·신장기", "꽃봉오리 형성기", "절화 전 품질관리기"],
+      symptoms: "어린 유충은 잎 표면을 집단 가해하고 자라면서 분산해 잎과 연한 조직에 불규칙한 식흔과 구멍을 만든다. 생육 초기에는 생육 지연, 꽃봉오리 형성기 이후에는 절화 품질 저하로 이어질 수 있다.",
+      monitoring: "페로몬트랩으로 성충 발생을 확인하고 하엽, 어린잎, 신초와 꽃봉오리 주변에서 알덩이, 어린 유충, 식흔과 배설물을 조사한다. 알은 30~100여 개씩 무더기로 산란될 수 있어 잎 뒷면과 신초를 반복 관찰한다.",
+      conditions: "안개꽃 기준 구체적인 발생 적온·습도·강우 숫자는 공식 공개자료에서 확인되지 않았다. 시설재배에서는 활착기 이후 전 생육기간 동안 발생 여부를 예찰해야 한다.",
+      controlType: "현장 예찰 후 등록 살충제 라벨 확인 또는 방충망, 페로몬트랩, 알덩이 제거, 어린 유충 포살, 피해 잎 제거",
+      sourceUrl: "https://www.nongsaro.go.kr/portal/ps/pss/pssa/insectSearchDtl.ps?menuId=PS00403&spcsCode=ZR1DS0362", imageUrl: "", imageSourceUrl: "", imageDescription: "직접 열리는 검증된 안개꽃 피해 사진 주소를 확인하지 못함",
+    },
+    {
+      type: "pest", name: "아메리카잎굴파리", stages: ["활착기", "영양생장기", "분지·신장기", "꽃봉오리 형성기", "절화 전 품질관리기"],
+      symptoms: "유충이 잎 내부에 구불구불한 굴을 뚫어 엽육을 가해한다. 성충의 흡즙·산란으로 잎에 작은 흰 반점이 생기며 피해가 많으면 광합성 능력과 절화 상품성이 낮아진다.",
+      monitoring: "황색 끈끈이트랩으로 성충을 확인하고 잎의 구불구불한 터널, 산란·흡즙 반점과 잎 속 유충을 조사한다. 묘 단계의 피해 여부와 측창·출입구 주변 성충 유입을 우선 확인한다.",
+      conditions: "안개꽃 기준 발생 적온·습도·강우·계절 숫자는 공식 공개자료에서 확인되지 않았다. 시설에서는 묘상부터 전 생육기간에 발생할 수 있고 피해 묘 반입, 성충 유입, 주변 잡초와 기주식물이 위험을 높인다.",
+      controlType: "현장 예찰 후 등록 살충제 라벨 확인 또는 황색 끈끈이트랩, 방충망, 건전묘 사용, 피해 잎·주변 잡초 제거, 천적 활용 검토",
+      sourceUrl: "https://www.nongsaro.go.kr/portal/ps/pss/pssa/insectSearchDtl.ps?menuId=PS00404&spcsCode=ZS1AC0011", imageUrl: "", imageSourceUrl: "", imageDescription: "직접 열리는 검증된 안개꽃 피해 사진 주소를 확인하지 못함",
+    },
+    {
+      type: "pest", name: "점박이응애", stages: ["활착기", "영양생장기", "분지·신장기", "꽃봉오리 형성기", "절화 전 품질관리기"],
+      symptoms: "잎 뒷면에서 세포 내용물을 빨아 잎 표면에 작은 흰 반점이 무더기로 나타난다. 피해가 심하면 잎이 마르고 하위 잎에서 상위 잎으로 확산되어 절화 상품성을 낮춘다.",
+      monitoring: "하엽부터 잎 뒷면을 확대경으로 관찰해 알, 약충, 성충, 거미줄, 흰 반점과 황화·갈변을 확인한다. 하우스 가장자리, 난방기 주변, 통풍이 약하고 건조한 구역을 우선 조사한다.",
+      conditions: "농사로 자료에서 발육 영점은 약 9℃, 발육 적온은 20~28℃, 적정 상대습도는 50~80%, 25℃에서 알부터 성충까지 약 10일이다. 국내 안개초 자료에서도 대기가 건조하면 응애 발생이 쉽다고 제시한다.",
+      controlType: "현장 예찰 후 등록 살비제 라벨 확인 또는 피해 잎 제거, 지나치게 건조한 구역 개선, 주변 잡초 제거, 천적 활용 검토",
+      sourceUrl: "https://www.nongsaro.go.kr/portal/ps/pss/pssa/insectSearchDtl.ps?menuId=PS00403&spcsCode=ZU1KT0035", imageUrl: "", imageSourceUrl: "", imageDescription: "직접 열리는 검증된 안개꽃 피해 사진 주소를 확인하지 못함",
+    },
+    {
+      type: "pest", name: "총채벌레류", stages: ["영양생장기", "분지·신장기", "꽃봉오리 형성기", "절화 전 품질관리기"],
+      symptoms: "어린잎, 신초, 꽃봉오리와 꽃잎을 흡즙해 은백색 반점, 갈변, 기형, 꽃잎 상처와 꽃봉오리 품질 저하를 일으킬 수 있다. 국내 안개초 자료에서는 종 수준까지 구분한 내용은 확인되지 않았다.",
+      monitoring: "청색 또는 황색 끈끈이트랩으로 성충을 확인한다. 신초, 어린잎, 꽃봉오리 내부와 꽃잎 사이를 털어 흰 종이 위에서 총채벌레류를 확인하고 출입구·잡초 주변과 꽃 속을 집중 조사한다.",
+      conditions: "안개초 기준 발생 적온·습도·강우·계절 숫자는 공식 공개자료에서 확인되지 않았다. 시설 내 고온, 주변 잡초·기주식물, 꽃봉오리와 꽃이 계속 형성되는 조건에서 위험이 커질 수 있다.",
+      controlType: "현장 예찰 후 등록 살충제 라벨 확인 또는 청색·황색 끈끈이트랩, 방충망, 잡초·피해 꽃봉오리 제거, 천적 활용 검토",
+      sourceUrl: "https://www.hst-j.org/articles/xml/ANA0/", imageUrl: "", imageSourceUrl: "", imageDescription: "직접 열리는 검증된 안개초 총채벌레류 사진 주소를 확인하지 못함",
+    },
+    {
+      type: "disease", name: "역병", stages: ["활착기", "영양생장기", "분지·신장기", "꽃봉오리 형성기", "절화 전 품질관리기"],
+      symptoms: "지제부와 뿌리가 과습 조건에서 썩고 지상부가 급격히 시들 수 있다. 발병 후 회복이 어렵고 절화 수량 감소로 이어질 수 있다.",
+      monitoring: "시드는 포기, 지제부 수침상 변색, 뿌리 부패와 생육 불균일 구역을 확인한다. 장마 전후, 관수 후 과습·배수 불량·연작 구역을 우선 조사하고 의심 포기는 뿌리와 지제부를 확인해 필요하면 전문기관에 진단을 의뢰한다.",
+      conditions: "전북특별자치도농업기술원 자료에서 장마기 이후 매년 20% 이상 발생하고 최근에는 6월 초부터 발병이 시작된다고 제시한다. 여름철·장마기 강우와 과습, 연작, 배수 불량에서 빠르게 확산될 수 있다. 두둑을 관행 20cm보다 10cm 이상 높이고 관수량을 줄이면 발생을 관행 대비 50%까지 억제할 수 있다고 제시한다.",
+      controlType: "현장 진단 후 등록 살균제 라벨 확인 또는 높은 이랑, 배수 개선, 관수량 조절, 장마기 과습 방지, 병든 포기 제거, 태양열 토양소독, 연작 피해 저감",
+      sourceUrl: "https://www.jbares.go.kr/board/view.jbares?boardId=BBS_0000004&categoryCode1=&categoryCode2=&categoryCode3=&dataSid=51964&menuCd=DOM_000000101002000000&paging=ok&startPage=418", imageUrl: "", imageSourceUrl: "", imageDescription: "직접 열리는 검증된 안개꽃 역병 사진 주소를 확인하지 못함",
+    },
+    {
+      type: "disease", name: "흰가루병(Erysiphe buhrii)", stages: ["영양생장기", "분지·신장기", "꽃봉오리 형성기", "절화 전 품질관리기"],
+      symptoms: "잎과 줄기 표면에 흰 가루 모양 균총이 생기고 진행되면 잎이 황화·갈변하며 노화가 빨라져 절화 품질이 떨어질 수 있다.",
+      monitoring: "하엽, 신초, 줄기와 잎 앞·뒷면의 흰 가루 모양 균총을 확인한다. 통풍이 약한 내부, 밀식 구역과 연약한 신초를 우선 조사하고 초기 흰 반점이 보이면 주변 포기까지 확대 관찰한다.",
+      conditions: "안개초 기준 발생 적온·습도·강우 숫자는 공식 공개자료에서 확인되지 않았다. 품종 간 저항성 차이가 있고 시설 내 통풍 불량, 과번무와 밀식 조건에서 주의가 필요하다.",
+      controlType: "현장 확인 후 등록 살균제 라벨 확인 또는 환기 개선, 밀식 완화, 과번무 억제, 병든 잎 제거, 품종 저항성 고려",
+      sourceUrl: "https://apsjournals.apsnet.org/doi/10.1094/PDIS-03-14-0237-PDN", imageUrl: "", imageSourceUrl: "", imageDescription: "직접 열리는 검증된 안개초 흰가루병 사진 주소를 확인하지 못함",
+    },
+    {
+      type: "disease", name: "시들음병(Fusarium wilt)", stages: ["활착기", "영양생장기", "분지·신장기", "꽃봉오리 형성기", "절화 전 품질관리기"],
+      symptoms: "잎 황화, 생육 부진, 포기 시들음, 줄기와 관부 약화 후 고사로 이어질 수 있다. 역병, 관부썩음병, 과습과 염류장해 증상과 혼동될 수 있다.",
+      monitoring: "생육 불량·황화 포기와 반복적으로 시드는 구역을 확인한다. 의심 포기의 뿌리, 관부와 줄기 단면의 갈변·부패 여부를 확인하고 전문기관 진단을 활용한다.",
+      conditions: "안개초 기준 발생 적온·습도·강우 숫자는 공식 공개자료에서 확인되지 않았다. 품종 간 발병도 차이가 있으며 연작, 토양 병원균 밀도 증가, 배수 불량, 뿌리 상처와 활착기 스트레스에서 주의가 필요하다.",
+      controlType: "현장 진단 후 등록 살균제 라벨 확인 또는 건전묘 사용, 배수 개선, 뿌리 상처 방지, 병든 포기 제거, 토양 위생관리, 연작 피해 저감",
+      sourceUrl: "https://www.hst-j.org/articles/xml/ANA0/", imageUrl: "", imageSourceUrl: "", imageDescription: "직접 열리는 검증된 안개초 시들음병 사진 주소를 확인하지 못함",
+    },
+    {
+      type: "disease", name: "관부썩음병(Fusarium proliferatum)", stages: ["활착기", "영양생장기", "분지·신장기"],
+      symptoms: "관부와 지제부가 썩고 포기가 위축되며 활착 불량과 시들음이 나타날 수 있다. 진행되면 지상부 생육 불량과 고사로 이어질 수 있다.",
+      monitoring: "활착 불량, 지제부 약화, 포기 위축, 시들음과 관부 부패가 의심되는 포기의 관부와 뿌리를 확인한다. 다른 토양병·과습·염류장해와 구분하기 위해 전문기관 동정을 활용한다.",
+      conditions: "안개초 기준 발생 적온·습도·강우·계절 숫자는 공식 공개자료에서 확인되지 않았다. 관부·뿌리 상처, 과습, 배수 불량, 연작, 활착기 스트레스와 병든 잔재물 조건에서 주의가 필요하다.",
+      controlType: "현장 진단 후 등록 살균제 라벨 확인 또는 건전묘 사용, 관부 상처 방지, 배수 개선, 병든 포기 제거, 토양·육묘상자 위생관리",
+      sourceUrl: "https://apsjournals.apsnet.org/doi/10.1094/PDIS-05-10-0376", imageUrl: "", imageSourceUrl: "", imageDescription: "직접 열리는 검증된 안개초 관부썩음병 사진 주소를 확인하지 못함",
+    },
+    {
+      type: "disease", name: "잿빛곰팡이병(Botrytis cinerea)", stages: ["분지·신장기", "꽃봉오리 형성기", "절화 전 품질관리기"],
+      symptoms: "꽃, 꽃봉오리, 잎과 줄기 상처 부위에 갈변, 물러짐과 회색 곰팡이가 발생할 수 있다. 안개꽃 기준 세부 병징 사진과 진행 단계는 공식 공개자료에서 충분히 확인되지 않았다.",
+      monitoring: "꽃봉오리와 꽃, 절화 예정 줄기, 잎끝, 줄기 상처와 결로가 오래 남는 밀식 부위를 확인한다. 회색 곰팡이·물러짐·갈변이 보이면 병든 조직을 제거하고 필요하면 전문기관에 확인을 의뢰한다.",
+      conditions: "공식 일반 병해충 자료에서 약 20℃ 전후와 높은 습도에서 발아와 포자 형성이 쉬운 것으로 제시된다. 시설 내 결로, 꽃·잎 표면의 장시간 습윤, 환기 부족, 밀식과 절화 전후 상처에서 주의가 필요하다.",
+      controlType: "현장 확인 후 등록 살균제 라벨 확인 또는 환기, 제습, 결로 억제, 밀식 완화, 병든 꽃·잎 제거, 절화도구 위생관리",
+      sourceUrl: "https://www.rda.go.kr/fileDownLoadDw.do?boardId=rdalw&dataNo=100000714504&sortNo=0", imageUrl: "", imageSourceUrl: "", imageDescription: "직접 열리는 검증된 안개꽃 잿빛곰팡이병 사진 주소를 확인하지 못함",
+    },
+    {
+      type: "disease", name: "균핵병(Sclerotinia sclerotiorum)", stages: ["활착기", "영양생장기", "분지·신장기", "꽃봉오리 형성기", "절화 전 품질관리기"],
+      symptoms: "지제부, 줄기와 잎에 물러짐과 갈변, 흰 균사와 검은 균핵 형성이 의심될 수 있다. 안개꽃 기준 세부 병징 사진과 진행 단계는 공식 공개자료에서 충분히 확인되지 않았다.",
+      monitoring: "지제부와 줄기 하부의 갈변·물러짐, 흰 균사와 검은 균핵 의심 구조를 확인한다. 병든 포기 주변 잔재물과 토양 표면을 함께 관찰하고 의심 시 전문기관에 진단을 의뢰한다.",
+      conditions: "안개꽃 기준 발생 적온·습도·강우 숫자는 공식 공개자료에서 확인되지 않았다. 시설 내 저온다습, 과습, 통풍 불량, 병든 잔재물 축적과 밀식에서 주의가 필요하다.",
+      controlType: "현장 진단 후 등록 살균제 라벨 확인 또는 병든 포기·잔재물 제거, 통풍 개선, 과습 방지, 밀식 완화, 토양 위생관리",
+      sourceUrl: "https://www.rda.go.kr/fileDownLoadDw.do?boardId=rdalw&dataNo=100000714504&sortNo=0", imageUrl: "", imageSourceUrl: "", imageDescription: "직접 열리는 검증된 안개꽃 균핵병 사진 주소를 확인하지 못함",
+    },
+    {
+      type: "disease", name: "오이모자이크바이러스병(CMV)", stages: ["활착기", "영양생장기", "분지·신장기", "꽃봉오리 형성기", "절화 전 품질관리기"],
+      symptoms: "국내 학술자료에서 Gypsophila paniculata에서 분리된 CMV가 보고되었다. 현장에서는 모자이크, 황화, 잎 변형, 위축과 생육 이상 등 바이러스 의심 증상을 관찰한다.",
+      monitoring: "모자이크, 황화, 잎 변형, 위축과 생육 이상 포기를 표시해 정상주와 구분하고 전문기관에 진단을 의뢰한다. 주변 잡초, 기주식물과 매개충 발생도 함께 확인한다.",
+      conditions: "안개초 기준 발생 적온·습도·강우·계절 숫자는 공식 공개자료에서 확인되지 않았다. 감염주, 주변 잡초·기주식물, 매개충, 작업 중 접촉과 도구 오염 가능성이 있는 조건에서 확산 위험이 있다.",
+      controlType: "재배적·물리적 방제 및 매개충 관리, 감염 의심주 제거, 잡초 제거, 작업도구 위생관리, 진단 후 대응",
+      sourceUrl: "https://link.springer.com/rwe/10.1007/978-81-322-3912-3_433", imageUrl: "", imageSourceUrl: "", imageDescription: "직접 열리는 검증된 안개초 CMV 병징 사진 주소를 확인하지 못함",
+    },
+  ],
+  generalPrevention: [
+    "정식 전 연작과 전작의 역병, 시들음병, 관부썩음병, 흰가루병, 응애, 나방류와 잎굴파리 발생 이력을 기록한다.",
+    "건전묘를 사용하고 정식 시 관부와 뿌리 상처를 줄인다.",
+    "여름철과 장마기에는 두둑을 높이고 배수로를 확보해 지제부와 뿌리의 장시간 과습을 막는다.",
+    "시설 상대습도와 결로를 줄이도록 환기, 순환팬, 제습과 적정 관수 시간을 관리한다.",
+    "하우스의 건조 구역, 난방기 주변과 가장자리의 잎 뒷면을 정기 확인해 점박이응애를 조기 발견한다.",
+    "황색 끈끈이트랩으로 잎굴파리류를, 청색 또는 황색 끈끈이트랩으로 총채벌레류를 확인한다.",
+    "왕담배나방과 파밤나방은 페로몬트랩과 꽃봉오리·신초 직접 관찰을 병행한다.",
+    "잡초와 주변 기주식물을 제거하고 병든 포기·잎·피해 꽃봉오리·절화 잔재물을 시설 밖으로 반출한다.",
+    "도구, 절화 가위, 육묘상자와 장갑을 청결하게 관리하고 병 발생 구역 작업 후 정상 구역으로 바로 이동하지 않는다.",
+    "바이러스 의심주는 표시하고 작업 순서를 뒤로 미루며 진단 전까지 정상주와 접촉을 줄인다.",
+    "농약은 병해충 동정과 발생 정도 확인 후 PSIS 등록정보와 제품 라벨을 확인해 판단한다.",
+  ],
+};
+FLOWER_PREVENTION.마트리카리아 = {
+  source: "재배 매뉴얼·국내 학술자료·EPPO",
+  sourceStatus: "NCPMS에서 마트리카리아·피버퓨·Tanacetum parthenium 작물명 직접 수록은 공개 검색 결과에서 확인되지 않아 미수록으로 처리. 국내 공식 공개자료에서 시설 절화용 마트리카리아 피버퓨(Tanacetum parthenium)의 병해충 상세자료는 제한적이며, 국내 학술자료에서 Matricaria chamomilla의 흰가루병 2종이 직접 확인됨. 절화용 Tanacetum parthenium 재배 매뉴얼에서 직접 확인되는 병해충은 참고자료로 포함하되, 국내 등록 농약 권장으로 해석하지 않음",
+  ncpmsCropName: "미수록",
+  standardName: "마트리카리아",
+  aliases: ["피버퓨", "화란국화", "마트리카리아 피버퓨", "Feverfew", "Matricaria", "Tanacetum parthenium", "Tanacetum parthenium (L.) Sch.Bip.", "Matricaria parthenium", "Chrysanthemum parthenium", "Pyrethrum parthenium", "German chamomile", "Matricaria chamomilla", "Matricaria recutita", "Chamomilla recutita"],
+  pests: ["잎굴파리류"],
+  diseases: ["관부썩음병", "피티움성 뿌리썩음병(Pythium)", "푸사리움성 시들음·뿌리썩음병(Fusarium)", "잿빛곰팡이병(Botrytis)", "흰가루병(Golovinomyces cichoracearum)", "흰가루병(Podosphaera xanthii)", "국화왜화바이로이드병(Chrysanthemum stunt viroid, CSVd)"],
+  caution: "마트리카리아·피버퓨·Tanacetum parthenium에 농약을 사용할 때는 먼저 현장에서 병해충을 확인하고, 농약안전정보시스템 PSIS에서 마트리카리아, 피버퓨, 국화류, 화훼류 등 실제 등록 작물명과 대상 병해충, 사용시기, 사용횟수, 안전사용기준, 약해 주의사항을 확인해야 한다. 농약 제품명, 희석배수, 혼용법은 공식 등록정보와 제품 라벨 확인 없이 임의 적용하지 않는다. Tanacetum parthenium 재배 매뉴얼에서는 질소 과다와 EC 0.5 이상 조건에서 잎끝 손상·leafburn을 피하기 위해 낮은 질소와 낮은 EC 관리를 제시하고, 습도 변화가 크면 leafburn이 생길 수 있다고 제시한다. 꽃봉오리 형성기와 절화 전 품질관리기에는 꽃잎 반점, 변색, 잎끝 손상, 절화 품질 저하 가능성이 있으므로 고온·강광·과습·건조 스트레스 상태의 처리를 피하고, 필요 시 소면적 예비 확인 후 사용한다.",
+  details: [
+    { type: "pest", name: "잎굴파리류", stages: ["활착기", "영양생장기", "분지·신장기", "꽃봉오리 형성기", "절화 전 품질관리기"], symptoms: "Tanacetum parthenium 절화 재배 매뉴얼에서 leaf miners에 대한 예방 관리가 언급된다. 잎굴파리류는 유충이 잎 내부 조직을 파고들어 구불구불한 굴 모양의 피해를 만들 수 있으며, 성충의 흡즙·산란 흔적으로 작은 흰 반점이 생길 수 있다. 피해가 증가하면 잎의 광합성 능력이 떨어지고 절화 품질이 낮아질 수 있다. 해당 매뉴얼에서 종 수준의 잎굴파리 이름은 공식 공개자료에서 확인되지 않음.", monitoring: "활착기 이후 새잎과 하엽을 모두 확인한다. 잎 표면의 구불구불한 굴, 흰색 흡즙 반점, 굴 끝의 유충 유무를 확대경으로 확인한다. 시설 출입구, 측창, 주변 잡초, 묘 반입 구역을 우선 조사하고, 황색 끈끈이트랩으로 작은 파리류 성충 유입 여부를 보조적으로 확인한다.", conditions: "Tanacetum parthenium 재배 매뉴얼에서 잎굴파리류 발생 적온, 상대습도, 계절, 강우 조건의 구체적 숫자는 공식 공개자료에서 확인되지 않음. 같은 매뉴얼의 재배조건은 발아 18~21℃, 생육 중 여름 22~24℃, 겨울 13~15℃, 최적 상대습도 75%, 정식 후 관수 뒤 빠르게 식물체를 말릴 것을 제시한다. 시설 내 연중 재배, 외부 성충 유입, 피해 묘 반입, 잡초 존재, 잎이 계속 전개되는 조건에서 예찰 필요성이 높다.", controlType: "현장 예찰 후 PSIS 등록 작물명·대상 해충·제품 라벨 확인 또는 황색 끈끈이트랩, 방충망, 피해 잎 제거, 잡초 제거, 건전묘 사용, 천적 활용 검토", sourceUrl: "https://www.infloracutflowers.com/resources/TechSheets/Evanthia/MatricariaCultivationManual.pdf", imageUrl: "", imageSourceUrl: "", imageDescription: "해당 해충 사진이며 직접 열리는 이미지 파일 주소는 확인하지 못해 빈 값 처리" },
+    { type: "disease", name: "관부썩음병", stages: ["활착기", "영양생장기", "분지·신장기"], symptoms: "Tanacetum parthenium 절화 재배 매뉴얼에서 정식 후 온도가 너무 낮을 때 crown rot이 발생할 수 있다고 제시된다. 관부와 지제부가 약해지고 썩으며, 활착 불량, 생육 지연, 시들음, 포기 고사로 이어질 수 있다. 병원균명은 해당 매뉴얼에서 공식 공개자료로 확인되지 않음.", monitoring: "정식 직후부터 활착이 늦은 포기, 지제부가 무르거나 갈변한 포기, 낮은 온도 구역, 과습 구역을 우선 확인한다. 의심 포기는 관부와 뿌리를 확인하고, Pythium·Fusarium·Botrytis·생리장해와 혼동될 수 있으므로 병원균 확인은 전문기관 진단을 이용한다.", conditions: "Tanacetum parthenium 재배 매뉴얼에서 관부썩음병은 정식 후 온도가 너무 낮을 때 발생한다고 제시된다. 같은 매뉴얼의 생육 온도 기준은 여름 주야간 22~24℃, 겨울 주야간 13~15℃이며, 최적 상대습도는 75%로 제시된다. 관부썩음병의 병원균별 발생 적온, 상대습도, 강우 조건의 구체적 숫자는 공식 공개자료에서 확인되지 않음. 저온, 과습, 배수 불량, 정식 직후 뿌리·관부 스트레스 조건에서 주의가 필요하다.", controlType: "현장 진단 후 PSIS 등록 작물명·대상 병해·제품 라벨 확인 또는 정식 후 저온 회피, 배수 개선, 과습 방지, 건전묘 사용, 병든 포기 제거, 재배상·상토 위생관리", sourceUrl: "https://www.infloracutflowers.com/resources/TechSheets/Evanthia/MatricariaCultivationManual.pdf", imageUrl: "", imageSourceUrl: "", imageDescription: "해당 병 사진이며 직접 열리는 이미지 파일 주소는 확인하지 못해 빈 값 처리" },
+    { type: "disease", name: "피티움성 뿌리썩음병(Pythium)", stages: ["활착기", "영양생장기", "분지·신장기"], symptoms: "Tanacetum parthenium 절화 재배 매뉴얼에서 연중 재배 시 Pythium을 피하기 위해 토양 증기소독 또는 예방적 관리가 필요하다고 제시된다. Pythium 피해는 활착 불량, 새뿌리 발생 저하, 뿌리 갈변·물러짐, 생육 부진, 시들음으로 나타날 수 있다. Tanacetum parthenium 기준 세부 병징은 공식 공개자료에서 확인되지 않음.", monitoring: "활착이 늦거나 생육이 불균일한 포기를 뽑아 새뿌리 발생, 뿌리 갈변, 물러짐, 뿌리 끝 부패를 확인한다. 과습한 베드, 배수 불량 구역, 관수 후 마르지 않는 구역, 반복 재배 구역을 우선 예찰한다. Fusarium, 관부썩음, 염류장해와 혼동될 수 있으므로 병원균 동정은 전문기관에 의뢰한다.", conditions: "Tanacetum parthenium 재배 매뉴얼에서 연중 재배 시 Pythium을 주의해야 한다고 제시된다. 같은 매뉴얼은 정식 후 충분히 관수하되 관수 뒤 식물체를 빠르게 말려 Botrytis를 피하고, 최적 상대습도 75%, 여름 생육 온도 22~24℃, 겨울 생육 온도 13~15℃를 제시한다. Pythium의 Tanacetum parthenium 기준 발생 적온, 상대습도, 강우량 숫자는 공식 공개자료에서 확인되지 않음. 과습, 배수 불량, 저산소 토양, 뿌리 상처, 연중 연속재배 조건에서 주의가 필요하다.", controlType: "현장 진단 후 PSIS 등록 작물명·대상 병해·제품 라벨 확인 또는 토양 증기소독, 배수 개선, 과습 방지, 건전묘 사용, 병든 포기와 뿌리 잔재물 제거, 재배상·상토 위생관리", sourceUrl: "https://www.infloracutflowers.com/resources/TechSheets/Evanthia/MatricariaCultivationManual.pdf", imageUrl: "", imageSourceUrl: "", imageDescription: "해당 병 사진이며 직접 열리는 이미지 파일 주소는 확인하지 못해 빈 값 처리" },
+    { type: "disease", name: "푸사리움성 시들음·뿌리썩음병(Fusarium)", stages: ["활착기", "영양생장기", "분지·신장기", "꽃봉오리 형성기", "절화 전 품질관리기"], symptoms: "Tanacetum parthenium 절화 재배 매뉴얼에서 연중 재배 시 Fusarium을 피하기 위해 토양 증기소독 또는 예방적 관리가 필요하다고 제시된다. Fusarium 피해는 뿌리와 지제부의 갈변, 생육 부진, 잎 황화, 시들음, 도관부 갈변, 포기 고사로 나타날 수 있다. Tanacetum parthenium 기준 병원균 종명과 세부 병징은 공식 공개자료에서 확인되지 않음.", monitoring: "반복적으로 시드는 포기, 생육이 뒤처지는 포기, 잎 황화 포기를 표시하고 뿌리·지제부·줄기 단면을 확인한다. 배수 불량 구역, 연중 재배 구역, 이전 작기 병 발생 구역을 우선 조사한다. 정확한 Fusarium 동정은 농업기술센터 또는 전문기관 진단을 이용한다.", conditions: "Tanacetum parthenium 재배 매뉴얼에서 연중 재배 시 Fusarium을 주의해야 한다고 제시된다. 같은 매뉴얼의 생육 온도 기준은 여름 22~24℃, 겨울 13~15℃, 최적 상대습도 75%이다. Fusarium의 Tanacetum parthenium 기준 발생 적온, 상대습도, 강우량, 계절 숫자는 공식 공개자료에서 확인되지 않음. 연작, 연중 재배, 병든 잔재물, 배수 불량, 뿌리 상처, 활착기 스트레스 조건에서 주의가 필요하다.", controlType: "현장 진단 후 PSIS 등록 작물명·대상 병해·제품 라벨 확인 또는 토양 증기소독, 연작 피해 저감, 건전묘 사용, 배수 개선, 뿌리 상처 방지, 병든 포기 제거, 재배상·상토 위생관리", sourceUrl: "https://www.infloracutflowers.com/resources/TechSheets/Evanthia/MatricariaCultivationManual.pdf", imageUrl: "", imageSourceUrl: "", imageDescription: "해당 병 사진이며 직접 열리는 이미지 파일 주소는 확인하지 못해 빈 값 처리" },
+    { type: "disease", name: "잿빛곰팡이병(Botrytis)", stages: ["분지·신장기", "꽃봉오리 형성기", "절화 전 품질관리기"], symptoms: "Tanacetum parthenium 절화 재배 매뉴얼에서 관수 후 식물체를 빠르게 말려 Botrytis를 피하라고 제시된다. 잿빛곰팡이병은 꽃봉오리, 꽃, 잎, 줄기 상처 부위에 갈변, 수침상 물러짐, 회색 곰팡이 발생을 일으킬 수 있다. Tanacetum parthenium 기준 세부 병징 사진과 병징 진행 단계는 공식 공개자료에서 확인되지 않음.", monitoring: "꽃봉오리 형성기 이후 꽃봉오리, 꽃, 잎끝, 줄기 상처 부위, 밀식으로 결로가 오래 남는 구역을 확인한다. 관수 후 늦게 마르는 구역, 상대습도가 높은 구역, 공기 순환이 약한 구역을 우선 예찰한다. 회색 곰팡이, 물러짐, 갈변이 보이면 병든 조직을 제거하고 필요 시 전문기관 진단을 의뢰한다.", conditions: "Tanacetum parthenium 재배 매뉴얼에서 최적 상대습도는 75%로 제시되며, 정식 후 충분히 관수하되 식물체를 빠르게 말려 Botrytis를 피하라고 제시된다. 같은 매뉴얼의 생육 온도는 여름 22~24℃, 겨울 13~15℃이다. Tanacetum parthenium 기준 Botrytis 발생 적온, 상대습도 임계값, 강우량 숫자는 공식 공개자료에서 확인되지 않음. 시설 내 결로, 관수 후 장시간 습윤, 환기 부족, 밀식, 절화 전후 상처, 저온다습 조건에서 주의가 필요하다.", controlType: "현장 확인 후 PSIS 등록 작물명·대상 병해·제품 라벨 확인 또는 환기, 제습, 공기 순환 개선, 관수 후 빠른 건조, 밀식 완화, 병든 꽃·잎 제거, 절화 도구 위생관리", sourceUrl: "https://www.infloracutflowers.com/resources/TechSheets/Evanthia/MatricariaCultivationManual.pdf", imageUrl: "", imageSourceUrl: "", imageDescription: "해당 병 사진이며 직접 열리는 이미지 파일 주소는 확인하지 못해 빈 값 처리" },
+    { type: "disease", name: "흰가루병(Golovinomyces cichoracearum)", stages: ["영양생장기", "분지·신장기", "꽃봉오리 형성기", "절화 전 품질관리기"], symptoms: "국내에서 Matricaria chamomilla에 Golovinomyces cichoracearum이 일으키는 흰가루병이 보고되었다. 잎 표면에 흰 가루 모양의 균총이 생기는 병으로, 감염 부위가 확대되면 잎의 광합성 저하, 황화, 갈변, 조기 노화, 절화 품질 저하가 발생할 수 있다. 원문 초록에서 Matricaria chamomilla 기준 세부 병징의 장문 설명은 공식 공개자료에서 제한적으로만 확인됨.", monitoring: "하엽, 신초, 잎 앞면과 뒷면의 흰 가루 모양 병징을 확인한다. 초기에는 작은 흰 반점으로 시작할 수 있으므로 통풍이 약한 내부, 밀식 구역, 잎이 겹치는 부위, 하우스 가장자리와 온습도 변화가 큰 구역을 정기적으로 관찰한다. 병원균 종 동정은 전문기관에 의뢰한다.", conditions: "Matricaria chamomilla 기준 Golovinomyces cichoracearum 흰가루병의 발생 적온, 상대습도, 강우량, 계절 조건 숫자는 공식 공개자료에서 확인되지 않음. 시설 내 통풍 불량, 밀식, 과번무, 잎 표면 관리 불량, 주야간 온도차가 큰 조건에서는 흰가루병 예찰 필요성이 높다.", controlType: "현장 확인 후 PSIS 등록 작물명·대상 병해·제품 라벨 확인 또는 환기 개선, 밀식 완화, 과번무 억제, 병든 잎 제거, 잎 표면 습윤과 결로 관리", sourceUrl: "https://bsppjournals.onlinelibrary.wiley.com/doi/10.1111/j.1365-3059.2010.02267.x", imageUrl: "", imageSourceUrl: "", imageDescription: "해당 병 사진이며 직접 열리는 이미지 파일 주소는 확인하지 못해 빈 값 처리" },
+    { type: "disease", name: "흰가루병(Podosphaera xanthii)", stages: ["영양생장기", "분지·신장기", "꽃봉오리 형성기", "절화 전 품질관리기"], symptoms: "국내에서 Matricaria chamomilla에 Podosphaera xanthii가 일으키는 흰가루병이 보고되었다. 잎과 줄기 표면에 흰 가루 모양 균총이 나타날 수 있으며, 병이 심하면 잎 황화, 갈변, 생육 저하, 절화 품질 저하가 발생할 수 있다. 원문 공개 범위에서 Matricaria chamomilla 기준 세부 병징과 발생 단계 설명은 제한적으로 확인됨.", monitoring: "잎 앞면과 뒷면, 신초, 줄기, 밀식된 내부 부위에서 흰 가루 모양 병징을 확인한다. 초기 병반이 보이는 포기는 표시하고 주변 포기까지 확대 관찰한다. Golovinomyces cichoracearum 흰가루병과 육안으로 구분이 어려울 수 있으므로 병원균 종 확인은 전문기관 동정을 이용한다.", conditions: "Matricaria chamomilla 기준 Podosphaera xanthii 흰가루병의 발생 적온, 상대습도, 강우량, 계절 조건 숫자는 공식 공개자료에서 확인되지 않음. 시설 내 통풍 불량, 밀식, 과번무, 주야간 온도차, 하우스 내부 습도 변동이 큰 조건에서 흰가루병 예찰 필요성이 높다.", controlType: "현장 확인 후 PSIS 등록 작물명·대상 병해·제품 라벨 확인 또는 환기 개선, 밀식 완화, 과번무 억제, 병든 잎 제거, 식물체 표면 결로 관리, 전문기관 진단", sourceUrl: "https://link.springer.com/article/10.1007/s42161-022-01043-z", imageUrl: "", imageSourceUrl: "", imageDescription: "해당 병 사진이며 직접 열리는 이미지 파일 주소는 확인하지 못해 빈 값 처리" },
+    { type: "disease", name: "국화왜화바이로이드병(Chrysanthemum stunt viroid, CSVd)", stages: ["활착기", "영양생장기", "분지·신장기", "꽃봉오리 형성기", "절화 전 품질관리기"], symptoms: "EPPO 자료에서 Tanacetum parthenium은 Chrysanthemum stunt viroid의 기주로 제시되며, Tanacetum parthenium cv. Matricaria Golden Ball에서는 왜화, 옅은 잎색, 짧고 밀집된 꽃차례가 나타날 수 있다고 제시된다. 국내 Tanacetum parthenium 시설재배지에서의 발생 사례는 공식 공개자료에서 확인되지 않음.", monitoring: "정상 포기와 비교해 키가 작아짐, 잎색이 옅어짐, 꽃차례가 짧고 밀집됨, 생육 균일도 저하가 보이는 포기를 표시한다. 바이로이드는 육안 진단만으로 확정하기 어려우므로 의심주는 RT-PCR 등 전문 진단을 의뢰한다. 삽수, 묘, 작업도구, 손 접촉을 통한 기계적 전염 가능성을 고려해 의심 구역 작업을 분리한다.", conditions: "Tanacetum parthenium 기준 CSVd의 발생 적온, 상대습도, 강우량, 계절 조건 숫자는 공식 공개자료에서 확인되지 않음. 바이로이드 감염묘 반입, 삽수 증식, 절화 가위와 작업도구 오염, 감염주와 정상주의 접촉, 연중 재배와 반복 작업 조건에서 확산 위험이 있다.", controlType: "재배적·물리적 방제 및 진단 기반 관리, 감염 의심주 격리·제거, 건전묘 사용, 삽수·묘 반입 검사, 절화 가위와 작업도구 소독, 작업 동선 분리", sourceUrl: "https://gd.eppo.int/download/file/528_datasheet_CSVD00.pdf", imageUrl: "", imageSourceUrl: "", imageDescription: "Tanacetum parthenium 병징 사진이며 직접 열리는 이미지 파일 주소는 확인하지 못해 빈 값 처리" },
+  ],
+  generalPrevention: [
+    "정식 전 마트리카리아가 피버퓨(Tanacetum parthenium)인지, 저먼캐모마일(Matricaria chamomilla)인지 품종·학명을 확인하고 기록한다.",
+    "건전묘와 건전 종자를 사용하고, 묘 반입 시 잎굴파리류 피해, 흰가루병, 왜화, 잎색 이상, 뿌리·관부 부패 여부를 확인한다.",
+    "정식 직후 저온과 과습을 피하고, 관부와 뿌리에 상처가 생기지 않도록 정식 작업을 관리한다.",
+    "Tanacetum parthenium 재배 매뉴얼 기준 발아 초기 온도는 18~21℃, 이후 18~20℃, 생육 온도는 여름 22~24℃, 겨울 13~15℃를 참고하되 국내 시설 조건에 맞게 조정한다.",
+    "Tanacetum parthenium 재배 매뉴얼 기준 최적 상대습도 75%를 참고하고, 관수 후 식물체가 빠르게 마르도록 환기와 공기 순환을 관리한다.",
+    "토양 또는 배지는 배수가 잘 되도록 관리하고, 재배 매뉴얼의 pH 5.0~6.5, EC 0.5 수준을 참고하되 실제 토양·배지 분석값에 따라 조정한다.",
+    "연중 재배 또는 반복 재배 시 Pythium과 Fusarium 위험을 낮추기 위해 재배상, 상토, 토양, 육묘 트레이의 위생을 관리하고 필요 시 토양 증기소독 등 비화학적 토양관리 방법을 검토한다.",
+    "황색 끈끈이트랩을 설치해 잎굴파리류와 작은 비행성 해충 유입을 확인한다.",
+    "흰가루병 예방을 위해 밀식과 과번무를 줄이고, 잎이 겹치는 내부까지 통풍이 되도록 관리한다.",
+    "관수는 오전에 실시해 야간까지 잎과 꽃이 젖어 있지 않도록 하고, 꽃봉오리 형성기 이후에는 결로와 장시간 습윤을 특히 주의한다.",
+    "병든 잎, 피해 잎, 시드는 포기, 부패한 뿌리와 관부, 절화 잔재물은 시설 밖으로 반출하고 포장 안에 방치하지 않는다.",
+    "작업도구, 절화 가위, 장갑, 육묘상자를 청결하게 관리하고 바이러스·바이로이드 의심주 작업 후 정상주로 바로 이동하지 않는다.",
+    "CSVd 등 바이로이드 의심 증상이 있으면 작업을 분리하고 전문기관 진단 전까지 삽수 채취와 포기 이동을 중단한다.",
+    "농약 사용은 병해충 동정, 발생 정도 확인, PSIS 등록정보와 제품 라벨 확인 후 판단하며, 특정 농약 살포를 무조건 전제로 하지 않는다.",
+  ],
+};
+function pesticideTypeFor(focus) {
+  const types = [];
+  if (/응애/.test(focus)) types.push("살비제");
+  if (/총채|진딧물|가루이|나방|벌레/.test(focus)) types.push("살충제");
+  if (/병|곰팡이|부패|녹병|노균|흰가루|역병|균핵/.test(focus)) types.push("살균제");
+  return Array.from(new Set(types)).join(" · ") || "등록 약제";
+}
+function housePreventionSchedule(house, bloomEstimates = [], weather = {}) {
+  const profileInfo = flowerProfile(house.flower);
+  const preventionProfile = getFlowerPrevention(profileInfo.key);
+  const [d1, d2, d3] = preventionProfile.diseases;
+  const pestGroup = (offset, fallback) => preventionProfile.pests.filter((_, i) => i % 3 === offset).join("·") || fallback;
+  const stages = [
+    { key: "root", from: 0, to: .16, title: "활착기", focus: `${d3 || "뿌리썩음"}·입고병·과습`, action: "배수와 관수량을 확인하고 시든 주·지제부 변색을 조사" },
+    { key: "growth", from: .16, to: .38, title: "영양생장기", focus: `${pestGroup(0, "해충 예찰")}·${d1 || "병징 예찰"}`, action: "새순과 잎 뒷면, 꽃 종류에 맞는 트랩을 주 2회 확인" },
+    { key: "branch", from: .38, to: .62, title: "분지·신장기", focus: `${pestGroup(1, "해충 예찰")}·${d2 || d1 || "병징 예찰"}`, action: "하엽과 생장점, 잎 뒷면을 확대 관찰하고 밀식·통풍 상태 확인" },
+    { key: "bud", from: .62, to: .84, title: "꽃봉오리 형성기", focus: `${pestGroup(2, "해충 예찰")}·${d3 || d1 || "병징 예찰"}`, action: "꽃봉오리와 꽃받침을 조사하고 야간 고습·결로를 확인" },
+    { key: "precut", from: .84, to: 1, title: "절화 전 품질관리기", focus: `${preventionProfile.pests.join("·")}·${preventionProfile.diseases.join("·")}`, action: "수확 예정 꽃의 반점·변색·충흔을 전수 확인하고 수확 전 안전사용기준 재확인" },
+  ];
+  return plantingRoundsFor(house).flatMap((round) => {
+    const estimate = bloomEstimates.find((x) => x.round === round.round);
+    const fallbackDays = Math.round((profileInfo.profile.bloomDays?.[0] + profileInfo.profile.bloomDays?.[1]) / 2);
+    const cutDate = estimate?.cutCenterDate || addDaysISO(round.date, fallbackDays);
+    const totalDays = Math.max(14, dayDiff(round.date, cutDate));
+    return stages.map((stage) => {
+      const details = (preventionProfile.details || []).filter((x) => x.stages.includes(stage.title));
+      return ({
+      id: `${round.round}-${stage.key}`,
+      round: round.round,
+      title: stage.title,
+      focus: stage.focus,
+      pesticideType: pesticideTypeFor(stage.focus),
+      flowerCaution: preventionProfile.caution,
+      details,
+      source: preventionProfile.source,
+      action: stage.action,
+      start: addDaysISO(round.date, totalDays * stage.from),
+      end: addDaysISO(round.date, totalDays * stage.to),
+      weatherNote: weather.humidity >= 80 && /곰팡이|부패|입고/.test(`${stage.focus}${stage.action}`)
+        ? "현재 외부 고습으로 병해 관찰 강화"
+        : weather.cur >= 28 && /응애|총채/.test(stage.focus) ? "현재 고온으로 해충 관찰 강화" : "",
+      });
+    });
+  });
+}
+function PreventionChecklist({ house, estimates, weather, update, showToast }) {
+  const schedule = housePreventionSchedule(house, estimates, weather);
+  const records = house.preventionRecords || {};
+  const recognized = flowerProfile(house.flower);
+  const preventionProfile = getFlowerPrevention(recognized.key);
+  const today = todayISO();
+  const scheduleBucket = (item) => {
+    if (today >= item.start && today <= item.end) return "today";
+    if (item.start > today && dayDiff(today, item.start) <= 7) return "week";
+    if (item.start > today) return "later";
+    return "past";
+  };
+  const bucketMeta = {
+    today: { title: "오늘 현장에서 확인", color: T.watch, description: "오늘 하우스에 들어가 직접 상태를 확인할 항목" },
+    week: { title: "7일 안에 준비", color: T.accent, description: "약제 등록 여부와 자재를 미리 확인할 항목" },
+    later: { title: "이후 예정", color: T.sub, description: "정식일 기준으로 자동 계산된 다음 예방 일정" },
+    past: { title: "지난 일정·기록 확인", color: T.faint, description: "완료 여부와 실제 살포 기록을 확인할 항목" },
+  };
+  const orderedSchedule = [...schedule].sort((a, b) => {
+    const rank = (item) => ({ today: 0, week: 1, later: 2, past: 3 })[scheduleBucket(item)];
+    const rankDiff = rank(a) - rank(b);
+    if (rankDiff) return rankDiff;
+    return scheduleBucket(a) === "past" ? b.end.localeCompare(a.end) : a.start.localeCompare(b.start);
+  });
+  const nearestId = orderedSchedule.find((item) => scheduleBucket(item) === "today" && !records[item.id]?.done)?.id
+    || orderedSchedule.find((item) => scheduleBucket(item) === "today")?.id
+    || orderedSchedule.find((item) => item.start > today)?.id
+    || orderedSchedule[0]?.id || "";
+  const [expandedId, setExpandedId] = useState(nearestId);
+  const [showFlowerReference, setShowFlowerReference] = useState(false);
+  const [detailOpen, setDetailOpen] = useState({});
+  const [enlargedImage, setEnlargedImage] = useState(null);
+  const todayItems = orderedSchedule.filter((item) => scheduleBucket(item) === "today");
+  const targetPriority = (item, detail) => {
+    let score = 20;
+    const reasons = [];
+    const periodDays = Math.max(1, dayDiff(item.start, item.end));
+    const elapsedDays = Math.max(0, dayDiff(item.start, today));
+    score += Math.round(Math.min(1, elapsedDays / periodDays) * 20);
+    if (dayDiff(today, item.end) <= 2) { score += 12; reasons.push("예찰기간 마감 임박"); }
+    const text = `${detail.name} ${detail.conditions} ${detail.symptoms}`;
+    if (weather.humidity >= 80 && (detail.type === "disease" || /습|과습|곰팡이|부패|결로/.test(text))) {
+      score += 25; reasons.push(`습도 ${weather.humidity}%`);
+    }
+    if (weather.rainProb >= 40 && detail.type === "disease") {
+      score += 12; reasons.push(`강수확률 ${weather.rainProb}%`);
+    }
+    if (weather.cur >= 28 && /응애|총채|나방|진딧물|가루이|고온|Fusarium/.test(text)) {
+      score += 22; reasons.push(`기온 ${weather.cur}℃`);
+    } else if (weather.cur >= 20 && weather.cur <= 25 && /작은뿌리파리|20~25/.test(text)) {
+      score += 16; reasons.push(`기온 ${weather.cur}℃`);
+    }
+    return {
+      score: Math.min(99, score),
+      reasons: reasons.length ? reasons : ["정식일 기준 생육단계"],
+    };
+  };
+  const pestLifecycleStatus = (detail) => {
+    if (detail.type !== "pest") return null;
+    const month = Number(today.slice(5, 7));
+    const temp = Number(weather.cur) || 20;
+    const humidity = Number(weather.humidity) || 60;
+    if (!detail.lifeCycle) {
+      const name = detail.name || "";
+      if (/응애/.test(name)) return {
+        label: temp >= 20 ? "성충·약충 증식 및 산란 가능" : "월동 성충 또는 저활동 상태 가능",
+        predictedStages: temp >= 20 ? ["성충", "약충", "알"] : ["성충"],
+        confidence: "보통",
+        explanation: `${temp}℃·습도 ${humidity}%와 계절을 기준으로 한 예방 예측입니다. 잎 뒷면에서 알·약충·성충이 함께 있을 가능성을 우선 확인하세요.`,
+        evidence: "점박이응애 공식자료의 발육 적온 20~28℃ 기준을 같은 응애류의 예방 확인 기준으로만 사용",
+      };
+      if (/나방/.test(name)) return {
+        label: month >= 5 && month <= 10 ? "성충 산란·알 부화·어린 유충 가해 가능" : "야외 월동 또는 저활동 가능",
+        predictedStages: month >= 5 && month <= 10 ? ["성충", "알", "어린 유충"] : ["번데기"],
+        confidence: "낮음",
+        explanation: "나방 종류별 세대 시기가 달라 정확한 충태 확정은 어렵지만, 예방 목적상 새잎·신초·꽃봉오리의 알과 어린 유충을 먼저 확인하도록 제시합니다.",
+        evidence: "해당 해충의 상세 월별 발육자료 부족",
+      };
+      if (/총채/.test(name)) return {
+        label: temp >= 20 ? "성충·유충 활동 및 산란 가능" : "활동 저하 가능",
+        predictedStages: temp >= 20 ? ["성충", "유충", "알"] : ["성충", "유충"],
+        confidence: "낮음",
+        explanation: `${temp}℃의 시설환경을 기준으로 꽃봉오리·신초 안에서 여러 충태가 겹칠 가능성을 예방값으로 표시합니다.`,
+        evidence: "안개초 총채벌레류의 종별 공식 발육자료 부족",
+      };
+      if (/진딧물/.test(name)) return {
+        label: temp >= 15 && temp <= 28 ? "무시충 증식·유시충 이동 가능" : "활동 저하 가능",
+        predictedStages: temp >= 15 && temp <= 28 ? ["약충", "성충"] : ["성충"],
+        confidence: "낮음",
+        explanation: "시설 내에서는 약충과 성충이 함께 증식할 수 있어 신초와 잎 뒷면을 우선 확인하는 예방 예측입니다.",
+        evidence: "해당 꽃·해충 조합의 월별 공식 발육자료 부족",
+      };
+      if (/잎굴파리/.test(name)) return {
+        label: temp >= 15 ? "성충 산란·잎 속 유충 가해 가능" : "활동 저하 가능",
+        predictedStages: temp >= 15 ? ["성충", "알", "유충"] : ["번데기", "성충"],
+        confidence: "낮음",
+        explanation: "황색트랩의 성충과 잎 속 굴 끝의 유충을 함께 확인하도록 하는 예방 예측입니다.",
+        evidence: "안개꽃 기준 세부 월별 발육자료 부족",
+      };
+      if (/선충/.test(name)) return {
+        label: "토양 속 알·유충·성충 혼재 가능",
+        predictedStages: ["알", "유충", "성충"],
+        confidence: "낮음",
+        explanation: "지상 날씨만으로 토양 속 충태를 구분할 수 없어, 생육기 토양 내 여러 충태가 존재할 가능성을 예방값으로 표시합니다.",
+        evidence: "토양검정 전 실제 밀도와 충태 확인 불가",
+      };
+      return {
+        label: "활동 충태 혼재 가능",
+        predictedStages: ["알", "유충", "성충"],
+        confidence: "낮음",
+        explanation: "공식 월별 발육자료가 부족하여 예방 목적의 넓은 예측 범위로 표시합니다.",
+        evidence: "해당 해충의 세부 생태자료 추가 필요",
+      };
+    }
+    if (detail.lifeCycle.kind === "cornEarworm") {
+      if (month >= 5 && month <= 6) return {
+        label: "월동 번데기 우화·산란 시작 구간",
+        predictedStages: ["성충", "알", "어린 유충"],
+        confidence: "높음",
+        explanation: "성충, 알과 어린 유충이 함께 관찰될 수 있습니다. 실제 충태는 페로몬트랩과 새잎·신초·꽃봉오리에서 확인해야 합니다.",
+        evidence: "번데기 월동, 5~6월 우화, 알은 약 3~4일 후 부화",
+      };
+      if (month >= 7 && month <= 10) return {
+        label: "세대 중첩·가해 활동 구간",
+        predictedStages: ["알", "유충", "성충"],
+        confidence: "높음",
+        explanation: "연 2~3세대가 이어져 알·유충·성충이 중첩될 수 있습니다. 날짜만으로 한 충태를 확정할 수 없습니다.",
+        evidence: "5~6월 우화 후 10월까지 피해, 알부터 우화까지 약 17~20일",
+      };
+      return {
+        label: "야외 월동 구간 예상",
+        predictedStages: ["번데기"],
+        confidence: "보통",
+        explanation: "야외에서는 땅속 번데기 월동이 중심이지만 가온 시설의 실제 발생 여부는 트랩으로 별도 확인해야 합니다.",
+        evidence: "땅속 번데기로 월동",
+      };
+    }
+    if (detail.lifeCycle.kind === "fungusGnat") {
+      if (month >= 6 && month <= 8) return {
+        label: "여름철 빠른 세대 진행 가능",
+        predictedStages: ["알", "유충", "번데기", "성충"],
+        confidence: "높음",
+        explanation: "시설에서는 알·유충·번데기·성충이 겹쳐 존재할 수 있습니다. 피해를 주는 유충은 습한 배지와 뿌리 주변에서 확인해야 합니다.",
+        evidence: "6월 하순~8월 하순 알부터 성충까지 약 15일",
+      };
+      if ([4, 5, 9, 10].includes(month)) return {
+        label: "봄·가을 발생 증가 구간",
+        predictedStages: ["성충", "알", "유충"],
+        confidence: "높음",
+        explanation: "성충 증가와 산란, 뿌리 주변 유충 발생이 함께 나타날 수 있어 황색트랩과 배지를 같이 확인해야 합니다.",
+        evidence: "시설 내 연중 발생, 봄과 가을에 발생·피해 증가",
+      };
+      return {
+        label: "시설 내 연중 발생 가능",
+        predictedStages: ["알", "유충", "번데기", "성충"],
+        confidence: "보통",
+        explanation: "현재 충태는 날짜만으로 확정할 수 없습니다. 황색트랩의 성충과 습한 배지의 유충을 각각 확인해야 합니다.",
+        evidence: "25℃에서 알 4일·유충 14일·번데기 4일, 성충 수명 7~10일",
+      };
+    }
+    return { label: "활동 충태 혼재 가능", predictedStages: ["알", "유충", "성충"], confidence: "낮음", explanation: "등록된 생태자료 범위 안에서 넓게 예측한 예방값입니다.", evidence: "" };
+  };
+  const todayTargets = todayItems.flatMap((item) => (item.details || []).map((detail) => ({
+    item,
+    detail,
+    targetId: `${detail.type}:${detail.name}`,
+    ...targetPriority(item, detail),
+  }))).sort((a, b) => b.score - a.score || a.detail.name.localeCompare(b.detail.name));
+  useEffect(() => {
+    setExpandedId(nearestId);
+  }, [house.id, nearestId]);
+  const setRecord = (id, patch) => update((s) => ({
+    ...s,
+    houses: s.houses.map((h) => h.id === house.id ? {
+      ...h,
+      preventionRecords: {
+        ...(h.preventionRecords || {}),
+        [id]: { ...(h.preventionRecords?.[id] || {}), ...patch, updatedAt: Date.now() },
+      },
+      updatedAt: Date.now(),
+    } : h),
+  }));
+  const setTargetRecord = (itemId, targetId, patch) => {
+    const currentItem = records[itemId] || {};
+    const currentTarget = currentItem.targetRecords?.[targetId] || {};
+    setRecord(itemId, {
+      targetRecords: {
+        ...(currentItem.targetRecords || {}),
+        [targetId]: { ...currentTarget, ...patch, updatedAt: Date.now() },
+      },
+    });
+  };
+  if (!schedule.length) return <Empty text="정식일을 입력하면 절화 전 예방 일정이 생성됩니다" />;
+  return (
+    <div>
+      <div style={{
+        background: recognized.exact ? T.accent + "14" : T.caution + "14",
+        border: `1px solid ${recognized.exact ? T.accent : T.caution}55`,
+        borderRadius: 10, padding: 10, marginBottom: 10,
+      }}>
+        <div style={{ fontSize: 13, fontWeight: 900, color: recognized.exact ? T.accent : T.caution }}>
+          입력 꽃: {house.flower || "미입력"} → 판별 꽃: {recognized.exact ? (preventionProfile.standardName || recognized.key) : "전용 자료 없음"}
+        </div>
+        <div style={{ color: preventionProfile.source === "NCPMS" ? T.ok : T.watch, fontSize: 10, fontWeight: 800, marginTop: 5 }}>
+          자료 기준: {preventionProfile.source || "참고자료"}
+        </div>
+        <div style={{ color: T.faint, fontSize: 10, marginTop: 5 }}>
+          {recognized.exact
+            ? `${recognized.key} 전용 예방 목록이 적용되었습니다.`
+            : "입력한 꽃을 내부 화훼 목록에서 판별하지 못해 기타 화훼 공통 참고목록을 표시합니다. 정확한 꽃 이름으로 수정해 주세요."}
+        </div>
+        <button type="button" onClick={() => setShowFlowerReference((value) => !value)} style={{
+          marginTop: 8, border: `1px solid ${T.line}`, borderRadius: 8, padding: "7px 9px",
+          background: T.panel, color: T.ink, fontWeight: 800, fontSize: 12.5, cursor: "pointer",
+        }}>
+          꽃별 전체 병해충 자료 {showFlowerReference ? "접기 ▲" : "보기 ▼"}
+        </button>
+        {showFlowerReference && <div style={{ color: T.sub, fontSize: 12.5, lineHeight: 1.65, marginTop: 8 }}>
+          <b style={{ color: T.ink }}>해충:</b> {preventionProfile.pests.join(", ")}<br />
+          <b style={{ color: T.ink }}>병:</b> {preventionProfile.diseases.join(", ")}
+        </div>}
+        {showFlowerReference && preventionProfile.generalPrevention?.length > 0 && (
+          <div style={{ marginTop: 7, paddingTop: 7, borderTop: `1px solid ${T.line}`, color: T.sub, fontSize: 10, lineHeight: 1.55 }}>
+            <b style={{ color: T.ink }}>기본 예방:</b> {preventionProfile.generalPrevention.join(" · ")}
+          </div>
+        )}
+      </div>
+      <div style={{ fontSize: 12.5, color: T.faint, lineHeight: 1.55, marginBottom: 10 }}>
+        각 기간은 농약 의무 살포일이 아니라 집중 예찰·방제 판단 기간입니다. 실제 살포는 발생 확인, 등록 작물·병해충, 제품 라벨의 안전사용기준을 모두 충족할 때만 기록하세요.
+      </div>
+      <div style={{ background: T.watch + "16", border: `1px solid ${T.watch}55`, borderRadius: 11, padding: 11, marginBottom: 10 }}>
+        <div style={{ color: T.watch, fontSize: 13, fontWeight: 950 }}>오늘 {fmtDateFull(today)} 해야 할 일</div>
+        {todayTargets.length > 0 ? (
+          <div style={{ color: T.ink, fontSize: 12.5, lineHeight: 1.7, marginTop: 6 }}>
+            <div style={{ color: T.sub, fontSize: 10, marginBottom: 7 }}>
+              현재 날씨: {weather.cur}℃ · 습도 {weather.humidity}% · 강수확률 {weather.rainProb}%<br />
+              아래 순서는 발생 확정이 아니라 오늘 먼저 확인하면 좋은 순서입니다.
+            </div>
+            {todayTargets.map((target, index) => {
+              const tr = records[target.item.id]?.targetRecords?.[target.targetId] || {};
+              const typeLabel = target.detail.type === "pest" ? "해충" : "병";
+              const priorityLabel = target.score >= 65 ? "우선" : target.score >= 45 ? "주의" : "일반";
+              const priorityColor = target.score >= 65 ? T.danger : target.score >= 45 ? T.watch : T.accent;
+              const lifecycle = pestLifecycleStatus(target.detail);
+              return (
+                <div key={`today-${target.item.id}-${target.targetId}`} style={{ background: T.panel, border: `1px solid ${priorityColor}44`, borderRadius: 9, padding: 9, marginTop: 7 }}>
+                  <div style={{ display: "flex", justifyContent: "space-between", gap: 8, alignItems: "flex-start" }}>
+                    <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+                      {target.detail.imageUrl ? (
+                        <button type="button" onClick={() => setEnlargedImage(target.detail)} style={{ border: 0, padding: 0, background: "transparent", cursor: "zoom-in" }}>
+                          <img src={target.detail.imageUrl} alt={`${target.detail.name} 참고사진`} style={{ width: 52, height: 52, borderRadius: 8, objectFit: "cover", border: `1px solid ${T.line}` }} />
+                        </button>
+                      ) : (
+                        <div title="검증된 참고사진 미등록" style={{ width: 50, height: 50, borderRadius: 8, background: T.panel2, border: `1px solid ${T.line}`, display: "grid", placeItems: "center", fontSize: 23 }}>
+                          {target.detail.type === "pest" ? "🐛" : "🦠"}
+                        </div>
+                      )}
+                      <b>{index + 1}. {typeLabel} · {target.detail.name}</b>
+                    </div>
+                    <span style={{ color: priorityColor, fontSize: 10, fontWeight: 900 }}>{priorityLabel}</span>
+                  </div>
+                  {!target.detail.imageUrl && <div style={{ color: T.faint, fontSize: 9, marginTop: 3 }}>참고사진 미등록</div>}
+                  <div style={{ color: T.sub, fontSize: 10, marginTop: 3 }}>
+                    {target.item.round}차 {target.item.title} · {target.reasons.join(" · ")}
+                  </div>
+                  {lifecycle && (
+                    <div style={{ background: T.panel2, borderRadius: 7, padding: 7, marginTop: 6, color: T.sub, fontSize: 10, lineHeight: 1.55 }}>
+                      <b style={{ color: T.ink }}>오늘 예방 예측:</b> {lifecycle.label}
+                      {lifecycle.confidence && <span style={{ color: lifecycle.confidence === "높음" ? T.ok : lifecycle.confidence === "보통" ? T.watch : T.faint }}> · 신뢰도 {lifecycle.confidence}</span>}<br />
+                      {lifecycle.predictedStages?.length > 0 && <>예상 충태: <b>{lifecycle.predictedStages.join(" · ")}</b><br /></>}
+                      {lifecycle.explanation}
+                      {lifecycle.evidence && <><br /><span style={{ color: T.faint }}>공식 근거: {lifecycle.evidence}</span></>}
+                    </div>
+                  )}
+                  <div style={{ display: "flex", gap: 5, marginTop: 7, flexWrap: "wrap" }}>
+                    {[
+                      ["pending", "미확인"],
+                      ["checked", "현장 확인"],
+                      ["sprayed", "살포 완료"],
+                    ].map(([status, label]) => (
+                      <button key={status} type="button" onClick={() => setTargetRecord(target.item.id, target.targetId, {
+                        status,
+                        checkedDate: status === "checked" ? today : tr.checkedDate || "",
+                        sprayedDate: status === "sprayed" ? today : tr.sprayedDate || "",
+                      })} style={{
+                        border: `1px solid ${tr.status === status || (!tr.status && status === "pending") ? (status === "sprayed" ? T.caution : status === "checked" ? T.ok : T.line) : T.line}`,
+                        background: tr.status === status || (!tr.status && status === "pending") ? (status === "sprayed" ? T.caution + "22" : status === "checked" ? T.ok + "22" : T.panel2) : "transparent",
+                        color: status === "sprayed" ? T.caution : status === "checked" ? T.ok : T.sub,
+                        borderRadius: 7, padding: "5px 8px", fontSize: 10, fontWeight: 850, cursor: "pointer",
+                      }}>{label}</button>
+                    ))}
+                  </div>
+                  {tr.status === "checked" && <div style={{ color: T.ok, fontSize: 10, marginTop: 5 }}>현장 확인일 {fmtDateFull(tr.checkedDate || today)}</div>}
+                  {tr.status === "sprayed" && <div style={{ color: T.caution, fontSize: 10, marginTop: 5 }}>살포 완료일 {fmtDateFull(tr.sprayedDate || today)} · 등록 약제와 라벨 기준 확인 필요</div>}
+                  {target.detail.type === "pest" && (
+                    <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 6, marginTop: 7 }}>
+                      <select value={tr.observedStage || ""} onChange={(ev) => setTargetRecord(target.item.id, target.targetId, { observedStage: ev.target.value, observedDate: ev.target.value ? today : "" })} style={{ ...inputStyle, fontSize: 10 }}>
+                        <option value="">실제 충태 미확인</option>
+                        <option value="알">알 확인</option>
+                        <option value="유충">유충 확인</option>
+                        <option value="번데기">번데기 확인</option>
+                        <option value="성충">성충 확인</option>
+                        <option value="흔적만">피해 흔적만 확인</option>
+                      </select>
+                      <input type="date" value={tr.observedDate || ""} onChange={(ev) => setTargetRecord(target.item.id, target.targetId, { observedDate: ev.target.value })} style={{ ...inputStyle, fontSize: 10 }} />
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        ) : (
+          <div style={{ color: T.sub, fontSize: 12.5, marginTop: 6 }}>
+            오늘 날짜에 해당하는 집중 예방·예찰 작업은 없습니다. 다음 예정 일정을 미리 확인하세요.
+          </div>
+        )}
+      </div>
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: 7, marginBottom: 13 }}>
+        {[
+          ["오늘 확인", orderedSchedule.filter((item) => scheduleBucket(item) === "today" && !records[item.id]?.done).length, T.watch],
+          ["7일 내 준비", orderedSchedule.filter((item) => scheduleBucket(item) === "week").length, T.accent],
+          ["확인·경과", orderedSchedule.filter((item) => records[item.id]?.done || scheduleBucket(item) === "past").length, T.ok],
+        ].map(([label, count, color]) => (
+          <div key={label} style={{ background: `${color}12`, border: `1px solid ${color}44`, borderRadius: 10, padding: "9px 6px", textAlign: "center" }}>
+            <div style={{ color, fontSize: 18, fontWeight: 950 }}>{count}</div>
+            <div style={{ color: T.sub, fontSize: 10, marginTop: 2 }}>{label}</div>
+          </div>
+        ))}
+      </div>
+      {orderedSchedule.map((item, orderedIndex) => {
+        const r = records[item.id] || {};
+        const nextDate = r.sprayedDate && Number(r.intervalDays) > 0 ? addDaysISO(r.sprayedDate, Number(r.intervalDays)) : "";
+        const dilution = Number(String(r.dilutionRatio || "").replace(/,/g, ""));
+        const waterLiters = Number(r.waterLiters);
+        const productAmount = dilution > 0 && waterLiters > 0 ? Math.round((waterLiters * 1000 / dilution) * 10) / 10 : 0;
+        const current = today >= item.start && today <= item.end;
+        const upcoming = today < item.start;
+        const expanded = expandedId === item.id;
+        const plantingDate = plantingRoundsFor(house).find((round) => round.round === item.round)?.date || "";
+        const chronological = schedule
+          .filter((candidate) => candidate.round === item.round)
+          .sort((a, b) => a.start.localeCompare(b.start));
+        const itemIndex = chronological.findIndex((candidate) => candidate.id === item.id);
+        const nextItem = itemIndex >= 0 ? chronological[itemIndex + 1] : null;
+        const bucket = scheduleBucket(item);
+        const autoPassed = bucket === "past";
+        const effectiveDone = autoPassed || !!r.done;
+        const previousBucket = orderedIndex > 0 ? scheduleBucket(orderedSchedule[orderedIndex - 1]) : "";
+        const bucketInfo = bucketMeta[bucket];
+        return (
+          <React.Fragment key={item.id}>
+          {bucket !== previousBucket && (
+            <div style={{ margin: orderedIndex ? "18px 2px 8px" : "2px 2px 8px" }}>
+              <div style={{ color: bucketInfo.color, fontSize: 13, fontWeight: 950 }}>{bucketInfo.title}</div>
+              <div style={{ color: T.faint, fontSize: 10, marginTop: 2 }}>{bucketInfo.description}</div>
+            </div>
+          )}
+          <div key={item.id} style={{ border: `1px solid ${current ? T.watch : T.line}`, background: current ? T.watch + "0D" : T.panel2, borderRadius: 11, padding: 10, marginBottom: 8 }}>
+            <div style={{ display: "flex", alignItems: "flex-start", gap: 8 }}>
+              <div style={{ flex: 1 }}>
+                <button type="button" onClick={() => setExpandedId(expanded ? "" : item.id)} style={{
+                  width: "100%", border: 0, padding: 0, background: "transparent", cursor: "pointer",
+                  display: "flex", justifyContent: "space-between", gap: 8, alignItems: "flex-start", textAlign: "left",
+                }}>
+                  <span>
+                    <b style={{ color: current ? T.watch : T.ink }}>{item.round}차 · {item.title}</b>
+                    <span style={{ display: "block", color: T.sub, fontSize: 10, marginTop: 3 }}>
+                      예방 시작일 {fmtDateFull(item.start)}
+                    </span>
+                  </span>
+                  <span style={{ color: current ? T.watch : T.sub, fontSize: 12.5, textAlign: "right", whiteSpace: "nowrap" }}>
+                    {current ? "오늘 집중 예방 기간" : upcoming ? `${fmtDateFull(item.start)}부터` : "예방 기간 지남"} {expanded ? "▲" : "▼"}
+                  </span>
+                </button>
+                {expanded && <div style={{ marginTop: 9, paddingTop: 9, borderTop: `1px solid ${T.line}` }}>
+                <div style={{ background: current ? T.watch + "18" : T.accent + "10", border: `1px solid ${current ? T.watch : T.accent}44`, borderRadius: 8, padding: 9, marginBottom: 8, color: T.ink, fontSize: 12.5, lineHeight: 1.65 }}>
+                  <b style={{ color: current ? T.watch : T.accent }}>현장에서 할 일</b><br />
+                  ① {item.action}<br />
+                  ② 이상이 없으면 아래 ‘현장 확인 완료’를 체크<br />
+                  ③ 증상이 있으면 병해충 상세를 대조하고, 등록 약제를 실제 살포한 경우에만 살포일 기록
+                </div>
+                <label style={{ display: "flex", alignItems: "center", gap: 7, background: effectiveDone ? T.ok + "18" : T.panel, borderRadius: 8, padding: 9, marginBottom: 8, color: effectiveDone ? T.ok : T.ink, fontSize: 12.5, fontWeight: 900, cursor: autoPassed ? "default" : "pointer" }}>
+                  <input type="checkbox" checked={effectiveDone} disabled={autoPassed} onChange={(ev) => {
+                    const done = ev.target.checked;
+                    setRecord(item.id, { done, ...(done ? {} : { sprayed: false }) });
+                    if (done) showToast(`${house.name} · ${item.round}차 ${item.title} 현장 확인 완료`);
+                  }} style={{ accentColor: T.ok }} />
+                  {autoPassed ? `기간 경과 자동 체크 · ${fmtDateFull(item.end)} 종료 (실행 기록 아님)` : `현장 확인 완료 ${r.done ? "✓" : ""}`}
+                </label>
+                <div style={{ background: T.panel, borderRadius: 8, padding: 9, color: T.sub, fontSize: 12.5, lineHeight: 1.7 }}>
+                  <b style={{ color: T.ink }}>정식일:</b> {plantingDate ? fmtDateFull(plantingDate) : "미입력"}<br />
+                  <b style={{ color: T.ink }}>정식일 기준 예상 예방 시작일:</b> {fmtDateFull(item.start)}<br />
+                  <b style={{ color: T.ink }}>예상 집중 예방·예찰 기간:</b> {fmtDateFull(item.start)} ~ {fmtDateFull(item.end)}<br />
+                  <b style={{ color: T.ink }}>예방 확인 마감일:</b> {fmtDateFull(item.end)}<br />
+                  <b style={{ color: T.ink }}>다음 예상 예방 일정:</b> {nextItem ? `${nextItem.title} · ${fmtDateFull(nextItem.start)}부터` : "이번 차수의 마지막 예방 일정"}<br />
+                  <span style={{ color: T.faint, fontSize: 10 }}>※ 정식일과 예상 절화일로 계산한 현장 점검 일정이며, 병해충 발생 확정일은 아닙니다.</span>
+                </div>
+                <div style={{ color: T.sub, fontSize: 12.5, lineHeight: 1.55, marginTop: 7 }}>
+                  <b>예방 대상:</b> {item.focus}<br />
+                  <b>확인할 약제 분류:</b> {item.pesticideType}<br />
+                  {item.action}
+                </div>
+                <div style={{ color: T.caution, fontSize: 10, lineHeight: 1.5, marginTop: 4 }}>꽃별 약해 주의: {item.flowerCaution}</div>
+                {item.details?.map((detail) => {
+                  const detailId = `${house.id}-${item.id}-${detail.type}-${detail.name}`;
+                  const targetId = `${detail.type}:${detail.name}`;
+                  const targetRecord = r.targetRecords?.[targetId] || {};
+                  const isDetailOpen = detailOpen[detailId] ?? current;
+                  const detailTypeLabel = detail.type === "pest" ? "해충" : detail.type === "disease" ? "병" : detail.type;
+                  const lifecycle = pestLifecycleStatus(detail);
+                  return (
+                  <details key={detailId} open={isDetailOpen} onToggle={(ev) => {
+                    const open = ev.currentTarget.open;
+                    setDetailOpen((state) => state[detailId] === open ? state : { ...state, [detailId]: open });
+                  }} style={{ background: T.panel, borderRadius: 8, marginTop: 6, color: T.sub, fontSize: 10, lineHeight: 1.55 }}>
+                    <summary style={{ padding: 8, color: T.ink, fontWeight: 850, cursor: "pointer", listStylePosition: "inside" }}>
+                      <span style={{ color: detail.type === "pest" ? T.caution : T.accent }}>{detailTypeLabel}</span>
+                      {" · "}{detail.name} · {current ? "오늘 예방 대상" : "상세 내용 보기"}
+                    </summary>
+                    <div style={{ padding: "0 8px 9px", borderTop: `1px solid ${T.line}`, paddingTop: 8 }}>
+                      <div style={{ marginBottom: 8 }}>
+                        {detail.imageUrl ? (
+                          <button type="button" onClick={() => setEnlargedImage(detail)} style={{ border: 0, padding: 0, background: "transparent", cursor: "zoom-in" }}>
+                            <img src={detail.imageUrl} alt={`${detail.name} 참고사진`} style={{ width: 72, height: 72, objectFit: "cover", borderRadius: 9, border: `1px solid ${T.line}` }} />
+                          </button>
+                        ) : (
+                          <span style={{ color: T.faint }}>참고사진 미등록</span>
+                        )}
+                      </div>
+                      <b style={{ color: T.ink }}>방제 분류:</b> {detail.controlType}<br />
+                      <b style={{ color: T.ink }}>증상·피해:</b> {detail.symptoms}<br />
+                      <b style={{ color: T.ink }}>예찰:</b> {detail.monitoring}<br />
+                      <b style={{ color: T.ink }}>발생조건:</b> {detail.conditions}
+                      {detail.sourceUrl && <><br /><a href={detail.sourceUrl} target="_blank" rel="noreferrer" style={{ color: T.accent, fontWeight: 800 }}>원문 출처 열기</a></>}
+                      {lifecycle && (
+                        <div style={{ background: T.panel2, borderRadius: 7, padding: 7, marginTop: 8, lineHeight: 1.55 }}>
+                          <b style={{ color: T.ink }}>오늘 예방 예측:</b> {lifecycle.label}
+                          {lifecycle.confidence && <span style={{ color: lifecycle.confidence === "높음" ? T.ok : lifecycle.confidence === "보통" ? T.watch : T.faint }}> · 신뢰도 {lifecycle.confidence}</span>}<br />
+                          {lifecycle.predictedStages?.length > 0 && <>예상 충태: <b>{lifecycle.predictedStages.join(" · ")}</b><br /></>}
+                          {lifecycle.explanation}
+                          {lifecycle.evidence && <><br /><span style={{ color: T.faint }}>공식 근거: {lifecycle.evidence}</span></>}
+                          {detail.lifeCycle?.sourceUrl && <><br /><a href={detail.lifeCycle.sourceUrl} target="_blank" rel="noreferrer" style={{ color: T.accent, fontWeight: 800 }}>생태정보 원문 열기</a></>}
+                        </div>
+                      )}
+                      <div style={{ display: "flex", gap: 5, marginTop: 8, flexWrap: "wrap" }}>
+                        {[["pending", "미확인"], ["checked", "현장 확인"], ["sprayed", "살포 완료"]].map(([status, label]) => (
+                          <button key={status} type="button" onClick={() => setTargetRecord(item.id, targetId, {
+                            status,
+                            checkedDate: status === "checked" ? today : targetRecord.checkedDate || "",
+                            sprayedDate: status === "sprayed" ? today : targetRecord.sprayedDate || "",
+                          })} style={{
+                            border: `1px solid ${T.line}`, borderRadius: 7, padding: "5px 8px", cursor: "pointer",
+                            background: targetRecord.status === status || (!targetRecord.status && status === "pending") ? (status === "sprayed" ? T.caution + "22" : status === "checked" ? T.ok + "22" : T.panel2) : "transparent",
+                            color: status === "sprayed" ? T.caution : status === "checked" ? T.ok : T.sub,
+                            fontSize: 10, fontWeight: 850,
+                          }}>{label}</button>
+                        ))}
+                      </div>
+                      {targetRecord.status === "checked" && <div style={{ color: T.ok, marginTop: 5 }}>현장 확인일 {fmtDateFull(targetRecord.checkedDate || today)}</div>}
+                      {targetRecord.status === "sprayed" && <div style={{ color: T.caution, marginTop: 5 }}>살포 완료일 {fmtDateFull(targetRecord.sprayedDate || today)}</div>}
+                      {detail.type === "pest" && (
+                        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 6, marginTop: 7 }}>
+                          <select value={targetRecord.observedStage || ""} onChange={(ev) => setTargetRecord(item.id, targetId, { observedStage: ev.target.value, observedDate: ev.target.value ? today : "" })} style={{ ...inputStyle, fontSize: 10 }}>
+                            <option value="">실제 충태 미확인</option>
+                            <option value="알">알 확인</option>
+                            <option value="유충">유충 확인</option>
+                            <option value="번데기">번데기 확인</option>
+                            <option value="성충">성충 확인</option>
+                            <option value="흔적만">피해 흔적만 확인</option>
+                          </select>
+                          <input type="date" value={targetRecord.observedDate || ""} onChange={(ev) => setTargetRecord(item.id, targetId, { observedDate: ev.target.value })} style={{ ...inputStyle, fontSize: 10 }} />
+                        </div>
+                      )}
+                    </div>
+                  </details>
+                  );
+                })}
+                {item.weatherNote && <div style={{ color: T.caution, fontSize: 10, marginTop: 4 }}>⚠ {item.weatherNote}</div>}
+                {r.done && (
+                  <label style={{ display: "flex", alignItems: "center", gap: 7, background: r.sprayed ? T.caution + "18" : T.panel, borderRadius: 8, padding: 9, marginTop: 8, color: r.sprayed ? T.caution : T.sub, fontSize: 12.5, fontWeight: 900, cursor: "pointer" }}>
+                    <input type="checkbox" checked={!!r.sprayed} onChange={(ev) => {
+                      const sprayed = ev.target.checked;
+                      setRecord(item.id, {
+                        sprayed,
+                        sprayedDate: sprayed ? (r.sprayedDate || todayISO()) : r.sprayedDate || "",
+                      });
+                    }} style={{ accentColor: T.caution }} />
+                    병해충 징후를 확인하여 농약도 실제 살포함
+                  </label>
+                )}
+                {r.sprayed && (
+                  <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 7, marginTop: 8 }}>
+                    <div style={{ gridColumn: "1 / -1", color: T.caution, fontSize: 10, lineHeight: 1.5 }}>
+                      아래에는 실제로 사용한 제품 라벨과 살포 내용을 기록하세요. 예방 일정 자체가 농약 사용 지시는 아닙니다.
+                    </div>
+                    <Field label="실제 농약 살포일(사용자 입력)">
+                      <input type="date" style={inputStyle} value={r.sprayedDate || ""} onChange={(ev) => setRecord(item.id, { sprayedDate: ev.target.value })} />
+                    </Field>
+                    <Field label="라벨 재살포 간격(일)">
+                      <input type="number" min="1" style={inputStyle} value={r.intervalDays || ""} onChange={(ev) => setRecord(item.id, { intervalDays: ev.target.value })} placeholder="제품 라벨 기준" />
+                    </Field>
+                    <Field label="사용 제품명">
+                      <input style={inputStyle} value={r.productName || ""} onChange={(ev) => setRecord(item.id, { productName: ev.target.value })} placeholder="등록 제품 라벨명" />
+                    </Field>
+                    <Field label="농약 등록번호">
+                      <input style={inputStyle} value={r.registrationNo || ""} onChange={(ev) => setRecord(item.id, { registrationNo: ev.target.value })} placeholder="제품 라벨 등록번호" />
+                    </Field>
+                    <Field label="라벨 희석배수">
+                      <input inputMode="numeric" style={inputStyle} value={r.dilutionRatio || ""} onChange={(ev) => setRecord(item.id, { dilutionRatio: ev.target.value })} placeholder="예: 1000" />
+                    </Field>
+                    <Field label="만들 물의 양(L)">
+                      <input type="number" min="0" step="0.1" style={inputStyle} value={r.waterLiters || ""} onChange={(ev) => setRecord(item.id, { waterLiters: ev.target.value })} placeholder="예: 20" />
+                    </Field>
+                    {productAmount > 0 && (
+                      <div style={{ gridColumn: "1 / -1", background: T.panel, borderRadius: 8, padding: 9, color: T.ink, fontSize: 12.5, lineHeight: 1.6 }}>
+                        <b>단일 제품 조제 계산:</b> 물 {waterLiters}L에 제품 약 {productAmount}mL 또는 g<br />
+                        ① 물을 탱크에 절반 정도 채움 → ② 계량한 한 제품을 넣고 충분히 교반 → ③ 나머지 물을 채워 다시 교반<br />
+                        <span style={{ color: T.caution }}>제형에 따라 mL/g가 다릅니다. 라벨 단위를 확인하고 다른 제품과 임의 혼용하지 마세요.</span>
+                      </div>
+                    )}
+                    <div style={{ gridColumn: "1 / -1", fontSize: 12.5, color: nextDate ? T.accent : T.faint }}>
+                      다음 방제 판단일: <b>{nextDate ? fmtDateFull(nextDate) : "제품 라벨 간격을 입력하세요"}</b>
+                    </div>
+                  </div>
+                )}
+                </div>}
+              </div>
+            </div>
+          </div>
+          </React.Fragment>
+        );
+      })}
+      {enlargedImage && (
+        <div onClick={() => setEnlargedImage(null)} style={{ position: "fixed", inset: 0, zIndex: 9999, background: "#000D", display: "grid", placeItems: "center", padding: 18 }}>
+          <div onClick={(ev) => ev.stopPropagation()} style={{ width: "min(94vw, 620px)", background: T.panel, borderRadius: 14, padding: 12, border: `1px solid ${T.line}` }}>
+            <div style={{ display: "flex", justifyContent: "space-between", gap: 10, alignItems: "center", marginBottom: 9 }}>
+              <b style={{ color: T.ink }}>{enlargedImage.type === "pest" ? "해충" : "병"} · {enlargedImage.name}</b>
+              <button type="button" onClick={() => setEnlargedImage(null)} style={{ border: 0, background: T.panel2, color: T.ink, borderRadius: 8, padding: "6px 9px", cursor: "pointer" }}>닫기 ✕</button>
+            </div>
+            <img src={enlargedImage.imageUrl} alt={`${enlargedImage.name} 확대 참고사진`} style={{ display: "block", width: "100%", maxHeight: "72vh", objectFit: "contain", borderRadius: 10, background: "#000" }} />
+            {enlargedImage.imageSourceUrl && <a href={enlargedImage.imageSourceUrl} target="_blank" rel="noreferrer" style={{ display: "inline-block", color: T.accent, fontSize: 10, fontWeight: 800, marginTop: 8 }}>사진 출처 열기</a>}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+function PesticideModal({ state, update, farm, houses, targetHouses, onClose, showToast, weather }) {
+  const draftKey = "pesticide";
+  const existing = state.drafts[draftKey];
+  const [name, setName] = useState(existing?.data?.name || "");
+  const [target, setTarget] = useState(existing?.data?.target || "");
+  const [memo, setMemo] = useState(existing?.data?.memo || "");
+  const [symptomQuery, setSymptomQuery] = useState(existing?.data?.symptomQuery || "");
+  const [photoUrl, setPhotoUrl] = useState(null);
+  const [photoName, setPhotoName] = useState("");
+  const [pesticideCode, setPesticideCode] = useState(existing?.data?.pesticideCode || "");
+  const [itemName, setItemName] = useState(existing?.data?.itemName || "");
+  const [mechanism, setMechanism] = useState(existing?.data?.mechanism || "");
+  const [dilutionMemo, setDilutionMemo] = useState(existing?.data?.dilutionMemo || "");
+  const [firstObservedDate, setFirstObservedDate] = useState(existing?.data?.firstObservedDate || "");
+  const [showRecover, setShowRecover] = useState(!!existing && (existing.data?.name || existing.data?.target));
+  const diagnoses = useMemo(() => searchPestDiagnoses(symptomQuery), [symptomQuery]);
+  const selectedDiagnosis = PEST_DIAGNOSES.find((d) => d.target === target);
+  const selectedFlowers = Array.from(new Set(targetHouses.map((id) => houses.find((h) => h.id === id)?.flower).filter(Boolean)));
+  const prevention = preventiveWindow(target, firstObservedDate);
+
+  useEffect(() => () => { if (photoUrl) URL.revokeObjectURL(photoUrl); }, [photoUrl]);
+
+  // 입력 중 자동 임시저장
+  useEffect(() => {
+    update((s) => ({ ...s, drafts: { ...s.drafts, [draftKey]: { data: { name, target, memo, symptomQuery, firstObservedDate, pesticideCode, itemName, mechanism, dilutionMemo }, savedAt: Date.now() } } }));
+  }, [name, target, memo, symptomQuery, firstObservedDate, pesticideCode, itemName, mechanism, dilutionMemo]);
+
+  const save = () => {
+    if (!target) return showToast("대상 병해충을 먼저 선택하세요");
+    if (!name) return showToast("공식 등록정보를 확인한 농약명을 입력하세요");
+    const ts = Date.now();
+    const logs = targetHouses.map((houseId) => {
+      const h = houses.find((x) => x.id === houseId);
+      return {
+        id: uid(), farmId: farm.id, houseId, category: "pesticide", type: "농약", name: "농약 살포",
+        ts, flower: h?.flower || "", quantity: "", unit: "",
+        detail: `${name} / ${target}${firstObservedDate ? ` / 농장 공통 첫 발견·포획일 ${firstObservedDate}` : ""}${selectedDiagnosis ? ` / 권장 확인군: ${selectedDiagnosis.kind}` : ""}${pesticideCode ? ` / 농약 등록번호 ${pesticideCode}` : ""}${itemName ? ` / 품목명 ${itemName}` : ""}${mechanism ? ` / 작용기작 ${mechanism}` : ""}${dilutionMemo ? ` / 라벨 사용기준 ${dilutionMemo}` : ""}`,
+        memo: `${symptomQuery ? `증상: ${symptomQuery}` : ""}${photoName ? `${symptomQuery ? " · " : ""}진단사진: ${photoName}` : ""}${memo ? `${symptomQuery || photoName ? " · " : ""}${memo}` : ""}`,
+      };
+    });
+    update((s) => {
+      const d = { ...s.drafts }; delete d[draftKey];
+      return { ...s, workLogs: [...logs, ...s.workLogs], drafts: d };
+    });
+    showToast(`농약 살포 ${targetHouses.length}개 하우스 기록됨`);
+    onClose();
+  };
+  const discardDraft = () => {
+    setName(""); setTarget(""); setMemo(""); setSymptomQuery(""); setFirstObservedDate(""); setPesticideCode(""); setItemName(""); setMechanism(""); setDilutionMemo(""); setPhotoUrl(null); setPhotoName(""); setShowRecover(false);
+  };
+
+  return (
+    <Modal onClose={onClose} title="농약 살포 기록">
+      {showRecover && (
+        <div style={{ background: T.caution + "22", border: `1px solid ${T.caution}66`, borderRadius: 12, padding: 12, marginBottom: 14 }}>
+          <div style={{ fontSize: 13, fontWeight: 700, marginBottom: 8 }}>작성 중이던 농약 기록이 있습니다. 이어서 작성할까요?</div>
+          <div style={{ display: "flex", gap: 8 }}>
+            <Btn kind="primary" style={{ flex: 1, padding: "9px" }} onClick={() => setShowRecover(false)}>이어서 작성</Btn>
+            <Btn kind="danger" style={{ flex: 1, padding: "9px" }} onClick={discardDraft}>삭제</Btn>
+          </div>
+        </div>
+      )}
+      <div style={{ background: T.panel2, border: `1px solid ${T.line}`, borderRadius: 12, padding: 12, marginBottom: 14 }}>
+        <div style={{ fontSize: 14, fontWeight: 800, marginBottom: 8 }}>🔎 병해충 진단 보조</div>
+        <Field label="무슨 증상인가요?">
+          <input style={inputStyle} value={symptomQuery} onChange={(e) => setSymptomQuery(e.target.value)}
+            placeholder="예: 꽃잎이 갈색이고 작은 벌레가 보여요" />
+        </Field>
+        {diagnoses.length > 0 && (
+          <div style={{ marginBottom: 10 }}>
+            <div style={{ fontSize: 12.5, color: T.faint, marginBottom: 6 }}>증상과 비슷한 후보입니다. 실제 상태를 확인한 뒤 선택하세요.</div>
+            {diagnoses.slice(0, 4).map((d) => (
+              <button key={d.target} type="button" onClick={() => setTarget(d.target)}
+                style={{
+                  width: "100%", textAlign: "left", background: target === d.target ? T.accent + "22" : T.panel,
+                  border: `1px solid ${target === d.target ? T.accent : T.line}`, borderRadius: 9,
+                  padding: "9px 10px", color: T.ink, cursor: "pointer", marginBottom: 6,
+                }}>
+                <b>{d.target}</b> <span style={{ color: T.accent, fontSize: 11 }}>· {d.kind} 등록약 확인</span>
+                <div style={{ color: T.sub, fontSize: 12.5, marginTop: 3, lineHeight: 1.5 }}>{d.note}</div>
+              </button>
+            ))}
+          </div>
+        )}
+        <Field label="사진 촬영 또는 선택">
+          <input type="file" accept="image/*" capture="environment" style={{ ...inputStyle, padding: 8 }}
+            onChange={(e) => {
+              const file = e.target.files?.[0];
+              if (!file) return;
+              if (photoUrl) URL.revokeObjectURL(photoUrl);
+              setPhotoUrl(URL.createObjectURL(file));
+              setPhotoName(file.name || "병해충 사진");
+            }} />
+        </Field>
+        {photoUrl && (
+          <img src={photoUrl} alt="병해충 진단용" style={{ width: "100%", maxHeight: 190, objectFit: "contain", borderRadius: 10, background: T.bg, marginBottom: 10 }} />
+        )}
+        <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+          <a href="https://ncpms.rda.go.kr/" target="_blank" rel="noreferrer"
+            style={{ flex: 1, minWidth: 130, textAlign: "center", textDecoration: "none", background: T.accent, color: T.accentInk, borderRadius: 9, padding: "10px 8px", fontSize: 13, fontWeight: 800 }}>
+            공식 AI 사진 진단 열기
+          </a>
+          <a href="https://psis.rda.go.kr/" target="_blank" rel="noreferrer"
+            style={{ flex: 1, minWidth: 130, textAlign: "center", textDecoration: "none", background: T.ok + "22", color: T.ok, border: `1px solid ${T.ok}66`, borderRadius: 9, padding: "10px 8px", fontSize: 13, fontWeight: 800 }}>
+            등록 농약 검색
+          </a>
+        </div>
+        <div style={{ fontSize: 10, color: T.faint, lineHeight: 1.5, marginTop: 8 }}>
+          사진은 이 화면에서 미리보기만 하며 외부로 자동 전송하지 않습니다. 공식 AI 진단 사이트에서 사진을 직접 등록해 확인하세요.
+        </div>
+      </div>
+      <Field label="농약명"><input style={inputStyle} value={name} onChange={(e) => setName(e.target.value)} placeholder="예: 다이센엠45" /></Field>
+      <Field label="대상 병해충">
+        <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+          {PEST_TARGETS.map((t) => <Chip key={t} active={target === t} color={T.accent} onClick={() => setTarget(t)}>{t}</Chip>)}
+        </div>
+      </Field>
+      <div style={{ border: `1px solid ${T.watch}55`, background: T.watch + "0D", borderRadius: 12, padding: 12, marginBottom: 14 }}>
+        <div style={{ fontSize: 14, fontWeight: 900, color: T.watch, marginBottom: 5 }}>📅 농장 공통 예방 관찰 달력</div>
+        <div style={{ fontSize: 12.5, color: T.sub, lineHeight: 1.55, marginBottom: 9 }}>
+          벌레의 유입·세대 시기는 정식일보다 같은 지역의 날씨와 첫 포획일에 더 크게 좌우되므로 선택한 하우스 모두에 같은 기준일을 적용합니다.
+        </div>
+        <Field label="첫 발견 또는 트랩 포획일">
+          <input type="date" style={inputStyle} value={firstObservedDate} onChange={(e) => setFirstObservedDate(e.target.value)} />
+        </Field>
+        {prevention ? (
+          <div style={{ background: T.panel, borderRadius: 9, padding: 10, fontSize: 13, lineHeight: 1.65 }}>
+            <b style={{ color: T.watch }}>{prevention.key} 다음 집중 관찰 예상창</b><br />
+            {fmtDateFull(prevention.start)} ~ {fmtDateFull(prevention.end)}<br />
+            확인: {prevention.cue}<br />
+            <span style={{ color: T.faint }}>{prevention.weather} · 현재 외부 {weather?.cur ?? "—"}℃, 습도 {weather?.humidity ?? "—"}%</span>
+          </div>
+        ) : <div style={{ color: T.faint, fontSize: 11 }}>총채벌레·응애·진딧물·나방류·가루이는 첫 포획일을 입력하면 다음 집중 관찰 범위를 표시합니다.</div>}
+        <div style={{ color: T.caution, fontSize: 10, lineHeight: 1.5, marginTop: 7 }}>
+          이는 살포일 확정이 아닙니다. 알·유충·번데기·성충 전환일은 종과 하우스 내부 누적온도에 따라 달라집니다.
+        </div>
+      </div>
+      {selectedDiagnosis && (
+        <div style={{ background: T.accent + "14", border: `1px solid ${T.accent}44`, borderRadius: 10, padding: 10, marginBottom: 12, fontSize: 13, lineHeight: 1.6 }}>
+          <b style={{ color: T.accent }}>추천 확인 방향: {selectedDiagnosis.kind}</b><br />
+          작물 {selectedFlowers.length ? selectedFlowers.join(", ") : "미등록"}과 대상 {target}에 함께 등록된 제품만 농약안전정보에서 확인하세요.
+        </div>
+      )}
+      <div style={{ border: `1px solid ${T.ok}55`, background: T.ok + "0D", borderRadius: 12, padding: 12, marginBottom: 14 }}>
+        <div style={{ fontSize: 14, fontWeight: 800, color: T.ok, marginBottom: 8 }}>국내 등록 농약 정보 기록</div>
+        <div style={{ fontSize: 12.5, color: T.sub, lineHeight: 1.5, marginBottom: 8 }}>
+          제품 라벨 또는 농약안전정보시스템에서 작물 <b>{selectedFlowers[0] || "꽃 미등록"}</b> · 병해충 <b>{target || "미선택"}</b> 등록 여부를 확인한 뒤 적어주세요.
+        </div>
+        <Field label="농약 등록번호"><input style={inputStyle} value={pesticideCode} onChange={(e) => setPesticideCode(e.target.value)} placeholder="제품 라벨의 등록번호" /></Field>
+        <Field label="품목명·유효성분"><input style={inputStyle} value={itemName} onChange={(e) => setItemName(e.target.value)} placeholder="예: 유효성분 또는 품목명" /></Field>
+        <Field label="작용기작 표시기호"><input style={inputStyle} value={mechanism} onChange={(e) => setMechanism(e.target.value)} placeholder="제품 라벨의 작용기작 번호·기호" /></Field>
+        <Field label="라벨 사용기준"><input style={inputStyle} value={dilutionMemo} onChange={(e) => setDilutionMemo(e.target.value)} placeholder="희석배수, 사용시기, 횟수 등 그대로 기록" /></Field>
+        <div style={{ fontSize: 10, color: T.faint, marginTop: 8 }}>
+          제조사나 상품명이 달라도 동일 작용기작의 연속 사용은 저항성을 높일 수 있습니다. 작용기작을 교호해 사용하고 제품 라벨을 최종 기준으로 삼으세요.
+        </div>
+      </div>
+      <Field label="메모"><input style={inputStyle} value={memo} onChange={(e) => setMemo(e.target.value)} placeholder="다음 방제 확인일 등" /></Field>
+      <div style={{ fontSize: 12.5, color: T.faint, lineHeight: 1.6, marginBottom: 12 }}>
+        ⓘ 진단 후보와 약제 종류는 참고용입니다. 농약은 등록 작물·대상 병해충·희석배수·사용 횟수·수확 전 안전사용기준을 공식 등록정보에서 반드시 확인하세요.
+      </div>
+      <Btn kind="primary" onClick={save} style={{ width: "100%" }}>저장</Btn>
+    </Modal>
+  );
+}
+
+function MemoModal({ update, farm, houses, targetHouses, onClose, showToast }) {
+  const [memo, setMemo] = useState("");
+  const save = () => {
+    if (!memo) return showToast("내용을 입력하세요");
+    const ts = Date.now();
+    const logs = targetHouses.map((houseId) => {
+      const h = houses.find((x) => x.id === houseId);
+      return { id: uid(), farmId: farm.id, houseId, category: "memo", type: "메모", name: "특이사항", ts, flower: h?.flower || "", quantity: "", unit: "", detail: "", memo };
+    });
+    update((s) => ({ ...s, workLogs: [...logs, ...s.workLogs] }));
+    showToast("특이사항 기록됨");
+    onClose();
+  };
+  return (
+    <Modal onClose={onClose} title="특이사항 기록">
+      <Field label="내용"><textarea style={{ ...inputStyle, minHeight: 90, resize: "vertical" }} value={memo} onChange={(e) => setMemo(e.target.value)} /></Field>
+      <Btn kind="primary" onClick={save} style={{ width: "100%" }}>저장</Btn>
+    </Modal>
+  );
+}
+
+/* --------- 전체 재배 이력 카탈로그 모달 (100여 종 작업) ---------- */
+const PLANTING_UNITS = ["주", "판", "트레이", "포트", "박스", "개"];
+/* 한글 친화 유사도 검색: 부분일치 우선 + 글자 겹침 보조 */
+function searchActions(query) {
+  const q = query.trim();
+  if (!q) return [];
+  const qChars = new Set(q.replace(/\s/g, "").split(""));
+  const results = [];
+  for (const g of HISTORY_CATALOG) {
+    for (const action of g.items) {
+      let score = 0;
+      if (action === q) score = 1000;
+      else if (action.includes(q)) score = 500 - action.length; // 부분일치
+      else if (q.includes(action)) score = 300;
+      else {
+        // 글자 겹침 비율
+        const aChars = action.replace(/\s/g, "").split("");
+        const overlap = aChars.filter((c) => qChars.has(c)).length;
+        if (overlap >= Math.min(2, q.length)) score = overlap * 10 - action.length;
+      }
+      if (score > 0) results.push({ group: g, action, score });
+    }
+  }
+  return results.sort((a, b) => b.score - a.score).slice(0, 30);
+}
+
+function HistoryCatalogModal({ selCount, onClose, onRecord }) {
+  const [openGroup, setOpenGroup] = useState(null); // 펼친 카테고리 cat
+  const [detailFor, setDetailFor] = useState(null);  // 정식 상세 입력 {cat, action}
+  const [d, setD] = useState({ quantity: "", unit: "주", detail: "", memo: "" });
+  const [query, setQuery] = useState("");
+  const searchResults = useMemo(() => searchActions(query), [query]);
+
+  const handlePick = (groupObj, action) => {
+    if (groupObj.detail) {
+      setDetailFor({ cat: groupObj.cat, action });
+      setD({ quantity: "", unit: "주", detail: "", memo: "" });
+    } else {
+      onRecord(groupObj.cat, action);
+      onClose();
+    }
+  };
+
+  const saveDetail = () => {
+    onRecord(detailFor.cat, detailFor.action, {
+      quantity: d.quantity, unit: d.quantity ? d.unit : "",
+      detail: d.detail, memo: d.memo,
+    });
+    onClose();
+  };
+
+  if (detailFor) {
+    return (
+      <Modal onClose={() => setDetailFor(null)} title={detailFor.action}>
+        <div style={{ fontSize: 13, color: T.sub, marginBottom: 12 }}>선택한 {selCount}개 하우스에 기록됩니다</div>
+        <div style={{ display: "flex", gap: 8 }}>
+          <Field label="수량"><input style={inputStyle} type="number" value={d.quantity} onChange={(e) => setD({ ...d, quantity: e.target.value })} placeholder="예: 1200" /></Field>
+          <Field label="단위">
+            <select style={{ ...inputStyle, appearance: "auto" }} value={d.unit} onChange={(e) => setD({ ...d, unit: e.target.value })}>
+              {PLANTING_UNITS.map((u) => <option key={u} value={u}>{u}</option>)}
+            </select>
+          </Field>
+        </div>
+        <Field label="공급처 / 품종 (선택)"><input style={inputStyle} value={d.detail} onChange={(e) => setD({ ...d, detail: e.target.value })} placeholder="예: ○○육묘장 / 보라" /></Field>
+        <Field label="메모 (선택)"><input style={inputStyle} value={d.memo} onChange={(e) => setD({ ...d, memo: e.target.value })} /></Field>
+        <Btn kind="primary" onClick={saveDetail} style={{ width: "100%" }}>저장</Btn>
+      </Modal>
+    );
+  }
+
+  return (
+    <Modal onClose={onClose} title="전체 재배 이력">
+      <div style={{ fontSize: 13, color: T.sub, marginBottom: 12 }}>
+        선택한 <b style={{ color: T.accent }}>{selCount}</b>개 하우스에 기록됩니다. 작업을 누르면 현재 시간으로 저장돼요.
+      </div>
+
+      {/* 검색창 */}
+      <input
+        style={{ ...inputStyle, marginBottom: 12 }}
+        value={query}
+        onChange={(e) => setQuery(e.target.value)}
+        placeholder="🔍 작업 검색 (예: 적심, 농약, 정식, 차광)"
+      />
+
+      {query.trim() ? (
+        // 검색 결과
+        <div>
+          {searchResults.length === 0 && <Empty text="검색 결과가 없습니다. 다른 말로 검색해보세요." />}
+          {searchResults.length > 0 && (
+            <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
+              {searchResults.map(({ group, action }) => (
+                <Chip key={group.cat + action} color={T.accent} onClick={() => handlePick(group, action)}>
+                  <span style={{ color: T.faint, fontSize: 11 }}>{group.icon} </span>{action}
+                </Chip>
+              ))}
+            </div>
+          )}
+        </div>
+      ) : (
+        // 카테고리 목록
+        HISTORY_CATALOG.map((g) => {
+          const open = openGroup === g.cat;
+          return (
+            <div key={g.cat} style={{ marginBottom: 10, border: `1px solid ${T.line}`, borderRadius: 12, overflow: "hidden" }}>
+              <button onClick={() => setOpenGroup(open ? null : g.cat)}
+                style={{ width: "100%", display: "flex", alignItems: "center", gap: 10, padding: "13px 14px", background: open ? T.panel2 : "transparent", border: "none", color: T.ink, cursor: "pointer" }}>
+                <span style={{ fontSize: 20 }}>{g.icon}</span>
+                <span style={{ fontWeight: 800, fontSize: 15 }}>{g.group}</span>
+                <span style={{ fontSize: 13, color: T.faint }}>{g.items.length}종</span>
+                <span style={{ marginLeft: "auto", color: T.faint, fontWeight: 800 }}>{open ? "−" : "+"}</span>
+              </button>
+              {open && (
+                <div style={{ padding: "4px 12px 12px", display: "flex", flexWrap: "wrap", gap: 6 }}>
+                  {g.items.map((action) => (
+                    <Chip key={action} color={T.accent} onClick={() => handlePick(g, action)}>{action}</Chip>
+                  ))}
+                </div>
+              )}
+            </div>
+          );
+        })
+      )}
+    </Modal>
+  );
+}
+
+function Modal({ children, onClose, title }) {
+  return (
+    <div onClick={onClose} style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,.6)", zIndex: 200, display: "flex", alignItems: "flex-end", justifyContent: "center" }}>
+      <div onClick={(e) => e.stopPropagation()} style={{ width: "100%", maxWidth: 460, background: T.panel, borderRadius: "20px 20px 0 0", padding: "18px 18px calc(24px + env(safe-area-inset-bottom))", maxHeight: "86vh", overflowY: "auto" }}>
+        <div style={{ width: 48, height: 5, background: T.line, borderRadius: 3, margin: "0 auto 14px" }} />
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10, marginBottom: 16 }}>
+          <div style={{ fontSize: 21, fontWeight: 800, lineHeight: 1.3 }}>{title}</div>
+          <button onClick={onClose} aria-label="닫기" style={{ flexShrink: 0, width: 44, height: 44, borderRadius: 12, background: T.panel2, border: `1px solid ${T.line}`, color: T.sub, fontSize: 22, fontWeight: 800, cursor: "pointer", lineHeight: 1 }}>✕</button>
+        </div>
+        {children}
+      </div>
+    </div>
+  );
+}
+
+/* ===================== 수확 화면 ==================================== */
+function HarvestScreen({ state, update, user, farm, showToast, weather }) {
+  const houses = state.houses.filter((h) => h.farmId === farm.id);
+  const ctx = { workLogs: state.workLogs, harvestLogs: state.harvestLogs, houseState: state.houseState, weatherHistory: state.weatherHistory, weather };
+  const [harvestModal, setHarvestModal] = useState(null);
+  return (
+    <div>
+      <ScreenHeader title="수확" sub="하우스별 절화와 수확 진행률" />
+
+      <div style={{ padding: "0 14px" }}>
+        <SectionTitle>절화 · 수확 진행률</SectionTitle>
+        {houses.map((h) => {
+          const e = computeHouseEstimate(h, ctx);
+          return (
+            <Card key={h.id} style={{ marginBottom: 10 }}>
+              <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 8 }}>
+                <span style={{ fontWeight: 800 }}>{h.name}</span>
+                <span style={{ color: T.sub, fontSize: 13 }}>{h.flower || "미등록"}</span>
+                {e.round > 1 && <span style={{ fontSize: 12.5, fontWeight: 800, color: T.ok, background: T.ok + "22", borderRadius: 6, padding: "2px 6px" }}>{e.round}차</span>}
+                <Btn kind="primary" style={{ marginLeft: "auto", padding: "11px 16px", fontSize: 15 }} onClick={() => setHarvestModal({ house: h, est: e })}>오늘 꽃 땄음</Btn>
+              </div>
+              <Gauge value={e.progress} color={T.accent} />
+              <div style={{ display: "flex", justifyContent: "space-between", gap: 8, fontSize: 13.5, color: T.sub, marginTop: 8, flexWrap: "wrap" }}>
+                <span>
+                  {e.round > 1 ? `${e.round}차 ${e.progress}% · 누적 ${e.cumulativePercent}%` : `${e.progress}%`}
+                  {e.expected ? ` · ${e.round > 1 ? e.roundHarvested : e.totalHarvested}/${e.expected}${h.unit || "송이"}` : ""}
+                </span>
+                <span>개화 예상 {e.bloomEstimate ? fmtDate(e.bloomEstimate.centerDate) : "정식일 필요"}</span>
+              </div>
+            </Card>
+          );
+        })}
+        {houses.length === 0 && <Card><Empty text="하우스를 먼저 추가하세요" /></Card>}
+      </div>
+
+      <Note />
+      <div style={{ height: 20 }} />
+
+      {harvestModal && <HarvestModal house={harvestModal.house} est={harvestModal.est} update={update} user={user} farm={farm} onClose={() => setHarvestModal(null)} showToast={showToast} />}
+    </div>
+  );
+}
+
+/* ===================== 출하 화면 ==================================== */
+function ShipmentScreen({ state, update, farm, showToast, weather }) {
+  const houses = state.houses.filter((h) => h.farmId === farm.id);
+  const shipments = state.shipments.filter((s) => s.farmId === farm.id).sort((a, b) => b.ts - a.ts);
+  const [editingShipment, setEditingShipment] = useState(null);
+  const [shipModalOpen, setShipModalOpen] = useState(false);
+
+  // 수확↔출하 비교(비파괴): 꽃별로 재배 동수·수확 중·출하 완료/대기 단수를 나란히 집계만 한다.
+  const ctx = { workLogs: state.workLogs, harvestLogs: state.harvestLogs, houseState: state.houseState, weatherHistory: state.weatherHistory, weather: weather || {} };
+  const flowerTally = (() => {
+    const map = {};
+    const ensure = (fl) => (map[fl] = map[fl] || { flower: fl, houses: 0, harvesting: 0, doneBundles: 0, waitBundles: 0 });
+    houses.forEach((h) => {
+      if (!h.flower) return;
+      const m = ensure(h.flower);
+      m.houses += 1;
+      const est = computeHouseEstimate(h, ctx);
+      if (est.progress > 0 && est.progress < 100) m.harvesting += 1;
+    });
+    shipments.forEach((s) => {
+      const done = s.status === "출하 완료";
+      (s.boxes || []).forEach((b) => (b.items || []).forEach((it) => {
+        if (!it.flower) return;
+        const m = ensure(it.flower);
+        const n = Number(it.bundles) || 0;
+        if (done) m.doneBundles += n; else m.waitBundles += n;
+      }));
+    });
+    return Object.values(map).sort((a, b) => (b.houses - a.houses) || (b.doneBundles + b.waitBundles - a.doneBundles - a.waitBundles));
+  })();
+
+  const closeModal = () => {
+    setShipModalOpen(false);
+    setEditingShipment(null);
+  };
+
+  return (
+    <div>
+      <ScreenHeader
+        title="출하"
+        sub="포장 상태, 출하 일정과 박스 기록"
+        right={<Btn kind="primary" style={{ padding: "11px 16px", fontSize: 15 }} onClick={() => setShipModalOpen(true)}>+ 출하 기록</Btn>}
+      />
+
+      {flowerTally.length > 0 && (
+        <div style={{ padding: "0 14px 6px" }}>
+          <SectionTitle>꽃별 수확↔출하 비교</SectionTitle>
+          <Card style={{ marginBottom: 10 }}>
+            {flowerTally.map((m) => (
+              <div key={m.flower} style={{ display: "flex", alignItems: "center", gap: 8, padding: "10px 0", borderBottom: `1px solid ${T.line}55`, flexWrap: "wrap" }}>
+                <span style={{ fontWeight: 800, fontSize: 15, minWidth: 72 }}>{m.flower}</span>
+                <span style={{ fontSize: 13.5, color: T.sub }}>재배 {m.houses}동{m.harvesting > 0 ? ` · 수확중 ${m.harvesting}동` : ""}</span>
+                <span style={{ marginLeft: "auto", fontSize: 14, color: T.ok, fontWeight: 800 }}>출하완료 {m.doneBundles}단</span>
+                <span style={{ fontSize: 14, color: T.watch, fontWeight: 800 }}>대기 {m.waitBundles}단</span>
+              </div>
+            ))}
+            <div style={{ fontSize: 12.5, color: T.faint, marginTop: 10, lineHeight: 1.6 }}>
+              수확 진행률(%)은 직감적 추정이고 등급·폐기로 빠지는 양이 있어, 출하한 박스·단과 자동으로 똑같이 맞추지 않습니다. 두 값을 나란히 보고 직접 비교하세요.
+            </div>
+          </Card>
+        </div>
+      )}
+
+      <div style={{ padding: "0 14px" }}>
+        {shipments.map((s) => (
+          <Card key={s.id} style={{ marginBottom: 10 }}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+              <div style={{ fontWeight: 800 }}>{s.destination || "출하처 미입력"}</div>
+              <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                <span style={{ fontSize: 14, color: T.accent, fontWeight: 800 }}>{s.status}</span>
+                <button onClick={() => { setEditingShipment(s); setShipModalOpen(true); }}
+                  style={{ background: T.panel2, border: `1px solid ${T.line}`, color: T.ink, cursor: "pointer", fontSize: 14, fontWeight: 800, borderRadius: 9, padding: "8px 13px" }}>수정</button>
+                <button onClick={() => { if (confirm("이 출하 기록을 삭제할까요?")) { update((st) => ({ ...st, shipments: st.shipments.filter((x) => x.id !== s.id) })); showToast("출하 기록 삭제됨"); } }}
+                  aria-label="출하 기록 삭제"
+                  style={{ background: T.panel2, border: `1px solid ${T.line}`, color: T.faint, cursor: "pointer", fontSize: 22, width: 38, height: 38, borderRadius: 9, padding: 0, lineHeight: 1 }}>×</button>
+              </div>
+            </div>
+            <div style={{ fontSize: 13, color: T.sub, marginTop: 4 }}>
+              {fmtDateTime(s.ts)} · {s.boxes.length}박스 · {s.boxes.reduce((a, b) => a + b.items.reduce((x, i) => x + (Number(i.bundles) || 0), 0), 0)}단{s.transport ? ` · ${s.transport}` : ""}
+            </div>
+            {(s.packed || s.scheduledDate) && (
+              <div style={{ fontSize: 13, color: s.scheduledDate ? T.watch : T.ok, marginTop: 5, fontWeight: 700 }}>
+                {s.packed ? "✓ 포장 완료" : ""}
+                {s.packed && s.scheduledDate ? " · " : ""}
+                {s.scheduledDate ? `예정 출하일 ${fmtDate(s.scheduledDate)}` : ""}
+              </div>
+            )}
+            <div style={{ fontSize: 13, color: T.faint, marginTop: 6, lineHeight: 1.6 }}>
+              {s.boxes.map((b, i) => (
+                <div key={i}>{i + 1}번 박스: {b.items.map((it) => `${it.flower} ${it.variety || ""} ${it.bundles}단`).join(", ")}</div>
+              ))}
+            </div>
+          </Card>
+        ))}
+        {shipments.length === 0 && <Card><Empty text="아직 출하 기록이 없습니다" /></Card>}
+      </div>
+      <Note />
+      <div style={{ height: 20 }} />
+
+      {shipModalOpen && (
+        <ShipmentModal
+          houses={houses}
+          state={state}
+          update={update}
+          farm={farm}
+          shipment={editingShipment}
+          onClose={closeModal}
+          showToast={showToast}
+        />
+      )}
+    </div>
+  );
+}
+
+function HarvestModal({ house, est, update, user, farm, onClose, showToast }) {
+  const startPct = est?.progress || 0;
+  const round = est?.round || 1;
+  const cumulative = est?.cumulativePercent || startPct;
+  const [amount, setAmount] = useState("");
+  const [pct, setPct] = useState(startPct);
+  const [usePct, setUsePct] = useState(true);
+  const [quality, setQuality] = useState("보통");
+  const [askNextRound, setAskNextRound] = useState(false);
+  const [confirmEnd, setConfirmEnd] = useState(false);
+  const [endPassword, setEndPassword] = useState("");
+
+  const delta = Math.max(0, pct - startPct); // 이번에 새로 올린 만큼
+  const newCumulative = (round - 1) * 100 + pct;
+
+  const doSave = () => {
+    const ts = Date.now();
+    const correctingProgress = pct < startPct;
+    update((s) => ({
+      ...s,
+      harvestLogs: [{ id: uid(), houseId: house.id, farmId: farm.id, ts, amount: Number(amount) || 0, unit: house.unit || "송이", percent: usePct ? Number(pct) : 0, progressMode: usePct, round, quality, memo: "" }, ...s.harvestLogs],
+      workLogs: [{
+        id: uid(), farmId: farm.id, houseId: house.id, category: "harvest", type: "절화/수확",
+        name: correctingProgress ? "수확 진행률 정정" : "오늘 꽃 땄음",
+        ts, flower: house.flower, quantity: amount || "", unit: house.unit || "송이",
+        detail: usePct ? `${round}차 ${pct}% · 누적 ${newCumulative}%${correctingProgress ? ` · 기존 ${startPct}%에서 정정` : ""}` : "", memo: "",
+      }, ...s.workLogs],
+    }));
+  };
+
+  const save = () => {
+    if (usePct) {
+      if (pct === startPct && !amount) return showToast(startPct >= 100 ? "수정할 진행률을 선택하세요" : "막대를 오른쪽으로 더 올리세요");
+      if (pct >= 100) {
+        // 선택을 마친 뒤 저장한다. '이대로 끝'은 비밀번호 확인이 필요하다.
+        setAskNextRound(true);
+        return;
+      }
+      doSave();
+      showToast(`${house.name} · ${round}차 ${pct}% (누적 ${newCumulative}%) 기록됨`);
+      onClose();
+    } else {
+      if (!amount) return showToast("수량을 입력하세요");
+      doSave();
+      showToast(`${house.name} · ${amount}${house.unit || "송이"} 기록됨`);
+      onClose();
+    }
+  };
+
+  // 다음 차수 시작: 막대 0%로 리셋, 누적은 이어감
+  const startNextRound = () => {
+    doSave();
+    update((s) => ({
+      ...s,
+      houses: s.houses.map((h) => (h.id === house.id ? { ...h, harvestRound: round + 1, updatedAt: Date.now() } : h)),
+    }));
+    showToast(`${round + 1}차 수확을 시작합니다 (누적 ${newCumulative}%부터 이어짐)`);
+    onClose();
+  };
+  const finishThisRound = async () => {
+    const expectedPassword = farm.joinPassword || user?.pwd || "";
+    if (!expectedPassword || !(await verifyPwd(endPassword, expectedPassword))) {
+      showToast("비밀번호가 맞지 않습니다");
+      return;
+    }
+    doSave();
+    showToast(`${round}차 수확 완료 처리됨`);
+    onClose();
+  };
+
+  const gaugeColor = pct >= 90 ? T.ok : pct >= 50 ? T.accent : T.watch;
+
+  // 다음 차수 확인 팝업
+  if (askNextRound) {
+    return (
+      <Modal onClose={() => {}} title={`${house.name} · ${round}차 수확 완료`}>
+        <div style={{ textAlign: "center", padding: "8px 0 16px" }}>
+          <div style={{ fontSize: 38, marginBottom: 8 }}>🌸</div>
+          <div style={{ fontSize: 16, fontWeight: 800, marginBottom: 8 }}>{round}차 수확이 100% 끝났습니다</div>
+          <div style={{ fontSize: 14, color: T.sub, lineHeight: 1.6 }}>
+            같은 꽃에서 다시 꽃대가 올라와 <b style={{ color: T.accent }}>{round + 1}차 수확</b>을 시작할까요?<br />
+            막대는 0%부터 다시 시작하고, 누적은 <b style={{ color: T.ok }}>{newCumulative}%</b>부터 이어집니다.
+          </div>
+        </div>
+        <Btn kind="primary" onClick={startNextRound} style={{ width: "100%", marginBottom: 8 }}>
+          네, {round + 1}차 수확 시작
+        </Btn>
+        {!confirmEnd ? (
+          <Btn kind="ghost" onClick={() => setConfirmEnd(true)} style={{ width: "100%" }}>아니요, 이대로 끝</Btn>
+        ) : (
+          <div style={{ marginTop: 10, padding: 12, background: T.panel2, border: `1px solid ${T.line}`, borderRadius: 12 }}>
+            <div style={{ fontSize: 13, color: T.sub, lineHeight: 1.6, marginBottom: 10 }}>
+              이 차수를 최종 완료하려면 농장 비밀번호를 입력하세요.
+            </div>
+            <input style={inputStyle} type="password" value={endPassword} onChange={(e) => setEndPassword(e.target.value)}
+              placeholder="농장 비밀번호" autoFocus />
+            <div style={{ display: "flex", gap: 8, marginTop: 8 }}>
+              <Btn kind="plain" onClick={() => { setConfirmEnd(false); setEndPassword(""); }} style={{ flex: 1 }}>취소</Btn>
+              <Btn kind="danger" onClick={finishThisRound} style={{ flex: 1 }}>비밀번호 확인 · 완료</Btn>
+            </div>
+          </div>
+        )}
+        <Btn kind="plain" onClick={() => { setAskNextRound(false); setConfirmEnd(false); setEndPassword(""); }}
+          style={{ width: "100%", marginTop: 8 }}>돌아가서 진행률 수정</Btn>
+      </Modal>
+    );
+  }
+
+  return (
+    <Modal onClose={onClose} title={`${house.name} · 오늘 꽃 땄음`}>
+      {round > 1 && (
+        <div style={{ background: T.ok + "1A", border: `1px solid ${T.ok}55`, borderRadius: 10, padding: "8px 12px", fontSize: 13, fontWeight: 700, color: T.ok, marginBottom: 12 }}>
+          {round}차 수확 중 · 누적 {cumulative}%
+        </div>
+      )}
+      <div style={{ display: "flex", gap: 8, marginBottom: 16 }}>
+        <Chip active={usePct} color={T.accent} onClick={() => setUsePct(true)} style={{ flex: 1, textAlign: "center", padding: "10px" }}>진행률(막대)로</Chip>
+        <Chip active={!usePct} color={T.accent} onClick={() => setUsePct(false)} style={{ flex: 1, textAlign: "center", padding: "10px" }}>수량으로</Chip>
+      </div>
+
+      {usePct ? (
+        <Field label={`${round}차 수확 · 오늘까지 얼마나 땄나요?`}>
+          <div style={{ fontSize: 13, color: T.sub, marginBottom: 8 }}>
+            {startPct >= 100
+              ? <>현재 100% 완료 기록입니다. 잘못 입력했다면 막대를 낮춰 <b style={{ color: T.accent }}>진행률을 정정</b>할 수 있습니다.</>
+              : <>막대가 지금 진행률(<b style={{ color: T.accent }}>{startPct}%</b>)에서 시작합니다. 오른쪽으로 더 올린 만큼 오늘 딴 걸로 기록돼요. 100%를 채우면 다음 차수를 물어봅니다.</>}
+          </div>
+          <div style={{ textAlign: "center", marginBottom: 10 }}>
+            <span style={{ fontSize: 40, fontWeight: 800, color: gaugeColor }}>{pct}</span>
+            <span style={{ fontSize: 20, fontWeight: 700, color: T.sub }}>%</span>
+            {delta > 0 && <span style={{ fontSize: 14, fontWeight: 700, color: T.ok, marginLeft: 8 }}>오늘 +{delta}%</span>}
+            {pct < startPct && <span style={{ fontSize: 14, fontWeight: 700, color: T.watch, marginLeft: 8 }}>정정 {startPct}% → {pct}%</span>}
+            {round > 1 && <div style={{ fontSize: 13, color: T.faint, marginTop: 2 }}>누적 {newCumulative}%</div>}
+          </div>
+          <div style={{ position: "relative", background: T.panel2, borderRadius: 10, height: 22, overflow: "hidden", border: `1px solid ${T.line}`, marginBottom: 4 }}>
+            <div style={{ position: "absolute", left: 0, top: 0, bottom: 0, width: `${pct < startPct ? pct : startPct}%`, background: T.faint + "55" }} />
+            <div style={{ position: "absolute", left: 0, top: 0, bottom: 0, width: `${Math.max(2, pct)}%`, background: gaugeColor, opacity: 0.85, transition: "width .1s" }} />
+          </div>
+          <input
+            type="range" min="0" max="100" step="1" value={pct}
+            onChange={(e) => setPct(Number(e.target.value))}
+            style={{ width: "100%", accentColor: gaugeColor, height: 36 }}
+          />
+          <div style={{ display: "flex", justifyContent: "space-between", fontSize: 12.5, color: T.faint, marginTop: 2 }}>
+            <span>0%</span><span>절반</span><span>다 땄음</span>
+          </div>
+          <div style={{ display: "flex", gap: 6, marginTop: 10, flexWrap: "wrap" }}>
+            {[0, 25, 50, 75, 90, 100].filter((v, i, a) => a.indexOf(v) === i).map((v) => (
+              <Chip key={v} active={pct === v} color={T.accent} onClick={() => setPct(v)} style={{ flex: 1, textAlign: "center" }}>{v}%</Chip>
+            ))}
+          </div>
+        </Field>
+      ) : (
+        <Field label={`오늘 딴 양 (${house.unit || "송이"})`}>
+          <input style={inputStyle} type="number" value={amount} onChange={(e) => setAmount(e.target.value)} placeholder="예: 300" />
+          <div style={{ fontSize: 12.5, color: T.faint, marginTop: 6 }}>수량으로 누적 기록합니다. 예상 총량을 하우스에 등록해두면 진행률이 자동 계산됩니다.</div>
+        </Field>
+      )}
+
+      <Field label="상품성">
+        <div style={{ display: "flex", gap: 6 }}>
+          {["상", "보통", "하"].map((q) => <Chip key={q} active={quality === q} color={T.accent} onClick={() => setQuality(q)}>{q}</Chip>)}
+        </div>
+      </Field>
+      <Btn kind="primary" onClick={save} style={{ width: "100%" }}>저장</Btn>
+    </Modal>
+  );
+}
+
+function ShipmentModal({ houses, state, update, farm, shipment, onClose, showToast }) {
+  const flowerOptions = Array.from(new Set(houses.map((h) => h.flower).filter(Boolean)));
+  const destinations = (state.destinations || []).filter((d) => d.farmId === farm.id);
+  const templates = (state.boxTemplates || []).filter((t) => t.farmId === farm.id);
+  const editing = !!shipment;
+  const firstItem = shipment?.boxes?.[0]?.items?.[0] || {};
+  const simpleEdit = !!shipment?.boxes?.length && shipment.boxes.every((box) =>
+    box.items?.length === 1 &&
+    box.items[0].flower === firstItem.flower &&
+    box.items[0].variety === firstItem.variety &&
+    Number(box.items[0].bundles) === Number(firstItem.bundles)
+  );
+  const initialBoxes = shipment?.boxes?.length
+    ? shipment.boxes.map((box) => ({
+        items: (box.items || []).map((it) => ({
+          flower: it.flower || "", variety: it.variety || "", bundles: String(it.bundles ?? ""),
+        })),
+      }))
+    : [{ items: [{ flower: flowerOptions[0] || "", variety: "", bundles: "" }] }];
+
+  const [mode, setMode] = useState(editing && !simpleEdit ? "detail" : "simple"); // simple | detail
+  const [destination, setDestination] = useState(shipment?.destination || "");
+  const [transport, setTransport] = useState(shipment?.transport || "");
+  const [status, setStatus] = useState(
+    shipment?.packed || shipment?.status === "포장 완료" ? "포장 완료" : (shipment?.status || "출하 완료")
+  );
+  const [afterPackingStatus, setAfterPackingStatus] = useState(
+    shipment?.status && shipment.status !== "포장 완료" ? shipment.status : "출하 대기"
+  );
+  const [scheduledDate, setScheduledDate] = useState(shipment?.scheduledDate || todayISO());
+
+  // 간단 모드
+  const [boxCount, setBoxCount] = useState(simpleEdit ? String(shipment.boxes.length) : "");
+  const [flower, setFlower] = useState(simpleEdit ? (firstItem.flower || "") : (flowerOptions[0] || ""));
+  const [variety, setVariety] = useState(simpleEdit ? (firstItem.variety || "") : "");
+  const [bundlesPerBox, setBundlesPerBox] = useState(simpleEdit ? String(firstItem.bundles ?? "") : "");
+
+  // 상세 모드: 박스별 구성 [{items:[{flower,variety,bundles}]}]
+  const [boxes, setBoxes] = useState(initialBoxes);
+
+  const STATUS_OPTS = ["포장 완료", "출하 대기", "출하 완료", "출하 보류"];
+  const AFTER_PACKING_OPTS = ["출하 대기", "출하 완료", "출하 보류"];
+  const TRANSPORT_OPTS = ["직접 운반", "택배", "화물", "위탁"];
+  const finalStatus = status === "포장 완료" ? afterPackingStatus : status;
+  const packed = status === "포장 완료";
+  const needsScheduledDate = finalStatus === "출하 대기" || finalStatus === "출하 보류";
+
+  const validateSchedule = () => {
+    if (needsScheduledDate && !scheduledDate) {
+      showToast("예정 출하일을 선택하세요");
+      return false;
+    }
+    return true;
+  };
+
+  // ---- 상세 모드 헬퍼 ----
+  const addBox = () => setBoxes((b) => [...b, { items: [{ flower: flowerOptions[0] || "", variety: "", bundles: "" }] }]);
+  const removeBox = (bi) => setBoxes((b) => b.filter((_, i) => i !== bi));
+  const addItem = (bi) => setBoxes((b) => b.map((box, i) => i === bi ? { ...box, items: [...box.items, { flower: flowerOptions[0] || "", variety: "", bundles: "" }] } : box));
+  const removeItem = (bi, ii) => setBoxes((b) => b.map((box, i) => i === bi ? { ...box, items: box.items.filter((_, j) => j !== ii) } : box));
+  const setItem = (bi, ii, key, val) => setBoxes((b) => b.map((box, i) => i === bi ? { ...box, items: box.items.map((it, j) => j === ii ? { ...it, [key]: val } : it) } : box));
+  const applyTemplateToBox = (bi, tpl) => setBoxes((b) => b.map((box, i) => i === bi ? { items: tpl.items.map((x) => ({ ...x })) } : box));
+
+  const totalBundlesDetail = boxes.reduce((a, box) => a + box.items.reduce((x, it) => x + (Number(it.bundles) || 0), 0), 0);
+
+  const saveDestinationIfNew = (s, name) => {
+    if (!name) return s;
+    if ((s.destinations || []).some((d) => d.farmId === farm.id && d.name === name)) return s;
+    return { ...s, destinations: [...(s.destinations || []), { id: uid(), farmId: farm.id, name, contact: "", phone: "", memo: "" }] };
+  };
+
+  const saveShipment = (s, builtBoxes) => {
+    const record = {
+      id: shipment?.id || uid(),
+      farmId: farm.id,
+      ts: shipment?.ts || Date.now(),
+      updatedAt: Date.now(),
+      destination,
+      transport,
+      status: finalStatus,
+      packed,
+      scheduledDate: needsScheduledDate ? scheduledDate : "",
+      boxes: builtBoxes,
+    };
+    return {
+      ...s,
+      shipments: editing
+        ? s.shipments.map((x) => (x.id === shipment.id ? record : x))
+        : [record, ...s.shipments],
+    };
+  };
+
+  const saveSimple = () => {
+    const bc = parseInt(boxCount) || 0;
+    if (!bc) return showToast("박스 수를 입력하세요");
+    if (!validateSchedule()) return;
+    const builtBoxes = Array.from({ length: bc }, (_, i) => ({
+      n: i + 1, items: [{ flower, variety, bundles: Number(bundlesPerBox) || 0 }],
+    }));
+    update((s) => saveDestinationIfNew(saveShipment(s, builtBoxes), destination));
+    showToast(editing ? "출하 기록을 수정했습니다" : `${finalStatus} · ${bc}박스 출하 기록`);
+    onClose();
+  };
+
+  const saveDetail = () => {
+    const valid = boxes.filter((box) => box.items.some((it) => Number(it.bundles) > 0));
+    if (valid.length === 0) return showToast("최소 한 박스에 단 수를 입력하세요");
+    if (!validateSchedule()) return;
+    const builtBoxes = valid.map((box, i) => ({
+      n: i + 1,
+      items: box.items.filter((it) => Number(it.bundles) > 0).map((it) => ({ flower: it.flower, variety: it.variety, bundles: Number(it.bundles) || 0 })),
+    }));
+    update((s) => saveDestinationIfNew(saveShipment(s, builtBoxes), destination));
+    showToast(editing ? "출하 기록을 수정했습니다" : `${finalStatus} · ${builtBoxes.length}박스 출하 기록`);
+    onClose();
+  };
+
+  const saveAsTemplate = (bi) => {
+    const box = boxes[bi];
+    const items = box.items.filter((it) => Number(it.bundles) > 0).map((it) => ({ flower: it.flower, variety: it.variety, bundles: Number(it.bundles) || 0 }));
+    if (items.length === 0) return showToast("저장할 구성이 없습니다");
+    const name = prompt("템플릿 이름 (예: 리시안셔스 기본 박스)");
+    if (!name) return;
+    update((s) => ({ ...s, boxTemplates: [...(s.boxTemplates || []), { id: uid(), farmId: farm.id, name, items }] }));
+    showToast(`템플릿 "${name}" 저장됨`);
+  };
+
+  return (
+    <Modal onClose={onClose} title={editing ? "출하 기록 수정" : "출하 기록"}>
+      {/* 출하처 */}
+      <Field label="출하처">
+        <input style={inputStyle} value={destination} onChange={(e) => setDestination(e.target.value)} placeholder="양재동 꽃시장" />
+        {destinations.length > 0 && (
+          <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginTop: 8 }}>
+            {destinations.map((d) => <Chip key={d.id} active={destination === d.name} color={T.ok} onClick={() => setDestination(d.name)}>{d.name}</Chip>)}
+          </div>
+        )}
+      </Field>
+
+      <div style={{ display: "flex", gap: 8 }}>
+        <Field label="운송 방식">
+          <select style={{ ...inputStyle, appearance: "auto" }} value={transport} onChange={(e) => setTransport(e.target.value)}>
+            <option value="">선택</option>
+            {TRANSPORT_OPTS.map((t) => <option key={t} value={t}>{t}</option>)}
+          </select>
+        </Field>
+        <Field label="상태">
+          <select style={{ ...inputStyle, appearance: "auto" }} value={status} onChange={(e) => setStatus(e.target.value)}>
+            {STATUS_OPTS.map((t) => <option key={t} value={t}>{t}</option>)}
+          </select>
+        </Field>
+      </div>
+
+      {status === "포장 완료" && (
+        <Field label="포장 후 출하 상태">
+          <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+            {AFTER_PACKING_OPTS.map((t) => (
+              <Chip key={t} active={afterPackingStatus === t} color={T.accent} onClick={() => setAfterPackingStatus(t)}>{t}</Chip>
+            ))}
+          </div>
+          <div style={{ fontSize: 12.5, color: T.faint, marginTop: 7, lineHeight: 1.5 }}>
+            포장을 마친 뒤 현재 출하가 대기 중인지, 완료됐는지, 보류됐는지 선택하세요.
+          </div>
+        </Field>
+      )}
+
+      {needsScheduledDate && (
+        <Field label={finalStatus === "출하 보류" ? "보류 후 예정 출하일" : "예정 출하일"}>
+          <input
+            style={inputStyle}
+            type="date"
+            value={scheduledDate}
+            min={todayISO()}
+            onChange={(e) => setScheduledDate(e.target.value)}
+          />
+          <div style={{ fontSize: 12.5, color: T.faint, marginTop: 6 }}>
+            {finalStatus === "출하 보류"
+              ? "보류된 물량을 다시 내보낼 예정 날짜입니다."
+              : "현재 대기 중인 물량이 농장에서 나갈 예정 날짜입니다."}
+          </div>
+        </Field>
+      )}
+
+      {finalStatus === "출하 완료" && (
+        <div style={{ background: T.ok + "1A", border: `1px solid ${T.ok}55`, borderRadius: 10, padding: "9px 12px", color: T.ok, fontSize: 13, fontWeight: 700, marginBottom: 14 }}>
+          출하 완료 기록은 예정일 없이 지금 완료된 것으로 저장됩니다.
+        </div>
+      )}
+
+      {/* 입력 방식 토글 */}
+      <div style={{ display: "flex", gap: 8, margin: "4px 0 16px" }}>
+        <Chip active={mode === "simple"} color={T.accent} onClick={() => setMode("simple")} style={{ flex: 1, textAlign: "center", padding: "10px" }}>간단 입력</Chip>
+        <Chip active={mode === "detail"} color={T.accent} onClick={() => setMode("detail")} style={{ flex: 1, textAlign: "center", padding: "10px" }}>박스별 상세</Chip>
+      </div>
+
+      {mode === "simple" ? (
+        <>
+          <Field label="꽃 / 품종">
+            <div style={{ display: "flex", gap: 8 }}>
+              <input style={inputStyle} value={flower} onChange={(e) => setFlower(e.target.value)} placeholder="리시안셔스" list="flower-opts" />
+              <input style={inputStyle} value={variety} onChange={(e) => setVariety(e.target.value)} placeholder="보라" />
+            </div>
+            <datalist id="flower-opts">{flowerOptions.map((f) => <option key={f} value={f} />)}</datalist>
+          </Field>
+          <div style={{ display: "flex", gap: 8 }}>
+            <Field label="박스 수"><input style={inputStyle} type="number" value={boxCount} onChange={(e) => setBoxCount(e.target.value)} placeholder="8" /></Field>
+            <Field label="박스당 단 수"><input style={inputStyle} type="number" value={bundlesPerBox} onChange={(e) => setBundlesPerBox(e.target.value)} placeholder="15" /></Field>
+          </div>
+          {boxCount && bundlesPerBox && (
+            <div style={{ fontSize: 14, color: T.accent, fontWeight: 700, marginBottom: 12 }}>
+              자동 계산: {boxCount}박스 × {bundlesPerBox}단 = {(parseInt(boxCount) || 0) * (parseInt(bundlesPerBox) || 0)}단
+            </div>
+          )}
+          <Btn kind="primary" onClick={saveSimple} style={{ width: "100%" }}>{editing ? "수정 저장" : "저장"}</Btn>
+        </>
+      ) : (
+        <>
+          {boxes.map((box, bi) => (
+            <div key={bi} style={{ border: `1px solid ${T.line}`, borderRadius: 12, padding: 12, marginBottom: 10 }}>
+              <div style={{ display: "flex", alignItems: "center", marginBottom: 8 }}>
+                <span style={{ fontWeight: 800 }}>{bi + 1}번 박스</span>
+                <span style={{ fontSize: 13, color: T.sub, marginLeft: 8 }}>
+                  {box.items.reduce((a, it) => a + (Number(it.bundles) || 0), 0)}단
+                </span>
+                {boxes.length > 1 && (
+                  <button onClick={() => removeBox(bi)} style={{ marginLeft: "auto", background: "none", border: "none", color: T.danger, cursor: "pointer", fontWeight: 700, fontSize: 12 }}>박스 삭제</button>
+                )}
+              </div>
+
+              {/* 템플릿 적용 */}
+              {templates.length > 0 && (
+                <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginBottom: 8 }}>
+                  {templates.map((t) => <Chip key={t.id} color={T.ok} onClick={() => applyTemplateToBox(bi, t)}>↺ {t.name}</Chip>)}
+                </div>
+              )}
+
+              {box.items.map((it, ii) => (
+                <div key={ii} style={{ display: "flex", gap: 6, marginBottom: 6, alignItems: "center" }}>
+                  <input style={{ ...inputStyle, padding: "9px 10px", flex: 2 }} value={it.flower} onChange={(e) => setItem(bi, ii, "flower", e.target.value)} placeholder="꽃" list="flower-opts" />
+                  <input style={{ ...inputStyle, padding: "9px 10px", flex: 1.5 }} value={it.variety} onChange={(e) => setItem(bi, ii, "variety", e.target.value)} placeholder="품종" />
+                  <input style={{ ...inputStyle, padding: "9px 10px", width: 56 }} type="number" value={it.bundles} onChange={(e) => setItem(bi, ii, "bundles", e.target.value)} placeholder="단" />
+                  {box.items.length > 1 && (
+                    <button onClick={() => removeItem(bi, ii)} style={{ background: "none", border: "none", color: T.faint, cursor: "pointer", fontSize: 18, padding: 0 }}>×</button>
+                  )}
+                </div>
+              ))}
+              <div style={{ display: "flex", gap: 8, marginTop: 6 }}>
+                <button onClick={() => addItem(bi)} style={{ background: "none", border: "none", color: T.accent, cursor: "pointer", fontWeight: 700, fontSize: 13 }}>+ 꽃 추가</button>
+                <button onClick={() => saveAsTemplate(bi)} style={{ marginLeft: "auto", background: "none", border: "none", color: T.sub, cursor: "pointer", fontWeight: 700, fontSize: 12 }}>이 구성 템플릿 저장</button>
+              </div>
+            </div>
+          ))}
+          <datalist id="flower-opts">{flowerOptions.map((f) => <option key={f} value={f} />)}</datalist>
+
+          <Btn kind="ghost" onClick={addBox} style={{ width: "100%", marginBottom: 12 }}>+ 박스 추가</Btn>
+          <div style={{ fontSize: 14, color: T.accent, fontWeight: 800, marginBottom: 12, textAlign: "center" }}>
+            총 {boxes.length}박스 / {totalBundlesDetail}단
+          </div>
+          <Btn kind="primary" onClick={saveDetail} style={{ width: "100%" }}>{editing ? "수정 저장" : "저장"}</Btn>
+        </>
+      )}
+    </Modal>
+  );
+}
+
+/* ===================== 하우스 상세 + 재배 타임라인 =================== */
+function HouseDetail({ state, update, farm, user, houseId, onBack, showToast, weather }) {
+  const house = state.houses.find((h) => h.id === houseId);
+  const [editing, setEditing] = useState(false);
+  const [tlFilter, setTlFilter] = useState("all");
+  if (!house) return null;
+  const e = computeHouseEstimate(house, { workLogs: state.workLogs, harvestLogs: state.harvestLogs, houseState: state.houseState, weatherHistory: state.weatherHistory, weather });
+
+  const timeline = state.workLogs
+    .filter((w) => w.houseId === houseId)
+    .filter((w) => tlFilter === "all" || w.category === tlFilter)
+    .sort((a, b) => b.ts - a.ts)
+    .slice(0, 60);
+
+  return (
+    <div style={{ flex: 1, overflowY: "auto", paddingBottom: 30 }}>
+      <div style={{ padding: "16px 14px 8px", display: "flex", alignItems: "center", gap: 10 }}>
+        <button onClick={onBack} style={{ background: T.panel2, border: `1px solid ${T.line}`, borderRadius: 10, padding: "8px 12px", color: T.ink, cursor: "pointer", fontWeight: 800 }}>← 뒤로</button>
+        <div style={{ fontSize: 20, fontWeight: 800 }}>{house.name}</div>
+        <StatusDot status={e.status} size={12} />
+        <button onClick={() => setEditing(true)} style={{ marginLeft: "auto", background: T.accent, border: "none", color: T.accentInk, fontWeight: 800, cursor: "pointer", borderRadius: 10, padding: "11px 16px", fontSize: 16 }}>✎ 정보 편집</button>
+      </div>
+
+      <div style={{ padding: "0 14px" }}>
+        <Card style={{ marginBottom: 10 }}>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 10, marginBottom: 12 }}>
+            <div style={{ display: "flex", gap: 10, alignItems: "flex-start", flex: 1, minWidth: 0 }}>
+              {house.flowerImage && (
+                <img src={house.flowerImage} alt={house.flower} style={{ width: 52, height: 52, borderRadius: 12, objectFit: "cover", border: `1px solid ${T.line}` }} />
+              )}
+              <div>
+                <div style={{ fontSize: 18, fontWeight: 800 }}>{house.flower || "꽃 미등록"} {house.variety && <span style={{ color: T.sub, fontWeight: 600, fontSize: 14 }}>· {house.variety}</span>}</div>
+                <div style={{ fontSize: 13, color: T.sub, marginTop: 4, lineHeight: 1.7 }}>
+                  {plantingRoundsFor(house).length ? (
+                    plantingRoundsFor(house).map((r) => (
+                      <div key={r.round}>
+                        <b style={{ color: r.round === e.bloomEstimate?.round ? "#E78AB5" : T.sub }}>{r.round}차 정식일</b>{" "}
+                        {fmtDateFull(r.date)}
+                      </div>
+                    ))
+                  ) : (
+                    <div>정식일 —</div>
+                  )}
+                </div>
+              </div>
+            </div>
+            <div style={{ textAlign: "right", flexShrink: 0, paddingTop: 2 }}>
+              {e.active ? (
+                <div style={{ display: "flex", alignItems: "center", justifyContent: "flex-end", gap: 6, whiteSpace: "nowrap" }}>
+                  <span style={{ fontSize: 12.5, color: T.sub }}>스트레스 · {STATUS[e.status].label}</span>
+                  <span style={{ fontSize: 24, fontWeight: 800, color: STATUS[e.status].color }}>{e.score}</span>
+                </div>
+              ) : (
+                <div style={{ fontSize: 13, color: T.faint }}>미시작</div>
+              )}
+            </div>
+          </div>
+          {e.active ? (
+            <>
+              <RiskBar label="꽃 화상 위험" value={e.burn} />
+              <RiskBar label="고습 병해 위험" value={e.disease} />
+              {e.reasons.length > 0 && (
+                <div style={{ fontSize: 13, color: T.sub, marginTop: 6, lineHeight: 1.6 }}>
+                  원인: {e.reasons.join(" · ")}
+                </div>
+              )}
+            </>
+          ) : (
+            <div style={{ fontSize: 13, color: T.faint, lineHeight: 1.6 }}>
+              아직 작업·꽃 등록이 없어 컨디션을 계산하지 않습니다. 편집에서 꽃·모종 심은 날을 넣거나, 빠른 작업에서 물주기 등을 기록하면 시작됩니다.
+            </div>
+          )}
+        </Card>
+
+        {/* 두둑 배치 미리보기 */}
+        {house.beds && Object.keys(house.beds).length > 0 && parseInt(house.bedCount) > 0 && (
+          <Card style={{ marginBottom: 10 }}>
+            <SectionTitle>두둑 배치</SectionTitle>
+            <div style={{ display: "flex", gap: 6, justifyContent: "center", overflowX: "auto", paddingBottom: 4 }}>
+              {Array.from({ length: parseInt(house.bedCount) }).map((_, b) => (
+                <div key={b} style={{ flex: "0 0 auto", minWidth: 40 }}>
+                  <div style={{ textAlign: "center", fontSize: 10, color: T.faint, marginBottom: 3 }}>{b + 1}</div>
+                  <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
+                    {Array.from({ length: parseInt(house.cellsPerBed) || 0 }).map((_, c) => {
+                      const cell = house.beds[`${b}-${c}`];
+                      const bg = cell ? (colorHex(cell.color) || T.accent) : "transparent";
+                      return (
+                        <div key={c} title={cell ? `${cell.flower || ""} · ${Math.min(cell.plantingRound || 1, plantingRoundsFor(house).length || 1)}차 정식` : "비어있음"}
+                          style={{
+                            height: 18, borderRadius: 3, background: cell ? bg : T.panel,
+                            border: cell ? "none" : `1px dashed ${T.line}`,
+                            display: "flex", alignItems: "center", justifyContent: "center",
+                            color: cell ? T.accentInk : T.faint, fontSize: 8, fontWeight: 900,
+                          }}>
+                          {cell ? `${Math.min(cell.plantingRound || 1, plantingRoundsFor(house).length || 1)}차` : ""}
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+              ))}
+            </div>
+          </Card>
+        )}
+
+        <Card style={{ marginBottom: 10 }}>
+          <SectionTitle>요약</SectionTitle>
+          <Row k="마지막 물" v={daysAgoLabel(e.lastWaterTs)} />
+          <Row k="마지막 농약" v={daysAgoLabel(e.lastPestTs)} />
+          <Row k="개폐기" v={e.vent === "open" ? "열림" : "닫힘"} />
+          <Row k="차광망" v={e.shade ? "사용 중" : "미사용"} />
+          {(e.bloomEstimates || []).length > 0 ? (
+            <div style={{ padding: "6px 0", borderBottom: `1px solid ${T.line}22` }}>
+              <div style={{ color: T.sub, fontSize: 14, marginBottom: 8 }}>차수별 AI 개화 예상</div>
+              {(e.bloomEstimates || []).map((est) => (
+                <div key={est.round} style={{
+                  background: est.round === e.bloomEstimate?.round ? "#E78AB518" : "transparent",
+                  border: est.round === e.bloomEstimate?.round ? "1px solid #E78AB555" : `1px solid ${T.line}55`,
+                  borderRadius: 9, padding: "8px 10px", marginBottom: 7,
+                }}>
+                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8 }}>
+                    <span style={{ color: est.round === e.bloomEstimate?.round ? "#E78AB5" : T.ink, fontWeight: 800 }}>
+                      🌸 {est.round}차 AI 개화 중심일
+                    </span>
+                    <span style={{ fontWeight: 800 }}>{fmtDateFull(est.centerDate)}</span>
+                  </div>
+                  <div style={{ color: T.sub, fontSize: 12.5, marginTop: 4 }}>
+                    예상 범위 {fmtDateFull(est.minDate)} ~ {fmtDateFull(est.maxDate)}
+                    {est.round === e.bloomEstimate?.round && <span style={{ color: "#E78AB5", fontWeight: 800 }}> · 현재 차수</span>}
+                  </div>
+                </div>
+              ))}
+            </div>
+          ) : (
+            <Row k="AI 개화 중심일" v="정식일 입력 필요" />
+          )}
+          <Row k="현재 차수 AI 절화 중심일" v={e.bloomEstimate ? fmtDateFull(e.bloomEstimate.cutCenterDate) : "—"} />
+          <Row k="현재 차수 절화 예상 범위" v={e.bloomEstimate ? `${fmtDateFull(e.bloomEstimate.cutMinDate)} ~ ${fmtDateFull(e.bloomEstimate.cutMaxDate)}` : "—"} />
+          <Row k="수확 진행률" v={e.round > 1 ? `${e.round}차 ${e.progress}% (누적 ${e.cumulativePercent}%)` : `${e.progress}%`} />
+          {e.bloomEstimate && (
+            <div style={{ marginTop: 10, padding: 10, borderRadius: 9, background: T.panel2, fontSize: 12.5, color: T.sub, lineHeight: 1.6 }}>
+              <b style={{ color: T.accent }}>예측 신뢰도 {e.bloomEstimate.confidence}%</b><br />
+              입력 꽃: <b style={{ color: T.ink }}>{house.flower || "미입력"}</b> · 판별: {e.bloomEstimate.profileName}<br />
+              {e.bloomEstimate.basis}
+              {e.bloomEstimate.adjustment !== 0 && ` · 환경 보정 ${e.bloomEstimate.adjustment > 0 ? "+" : ""}${e.bloomEstimate.adjustment}일`}
+              <br />개화와 절화 범위는 각각 중심일 앞뒤 3일, 총 7일입니다. 날씨와 관수 기록이 추가될 때마다 자동으로 다시 계산됩니다.
+            </div>
+          )}
+        </Card>
+
+        <Card style={{ marginBottom: 10 }}>
+          <SectionTitle>절화 전 예방 체크리스트</SectionTitle>
+          <PreventionChecklist
+            house={house}
+            estimates={e.bloomEstimates || []}
+            weather={weather || {}}
+            update={update}
+            showToast={showToast}
+          />
+        </Card>
+
+        <Card style={{ marginBottom: 10 }}>
+          <SectionTitle>오늘 추천 작업</SectionTitle>
+          {e.recs.map((r, i) => (
+            <div key={i} style={{ display: "flex", gap: 8, padding: "5px 0", fontSize: 14 }}>
+              <span style={{ color: T.accent }}>›</span>{r}
+            </div>
+          ))}
+        </Card>
+
+        <Card>
+          <SectionTitle>재배 타임라인</SectionTitle>
+          <div style={{ display: "flex", gap: 6, overflowX: "auto", paddingBottom: 8, marginBottom: 4 }}>
+            <Chip active={tlFilter === "all"} color={T.accent} onClick={() => setTlFilter("all")}>전체</Chip>
+            {["preparation", "planting", "growth_management", "watering", "nutrient", "facility", "pesticide", "disease_pest", "flowering", "harvest", "damage"].map((c) => (
+              <Chip key={c} active={tlFilter === c} color={T.accent} onClick={() => setTlFilter(c)}>{CAT_LABEL[c]}</Chip>
+            ))}
+          </div>
+          {timeline.length === 0 && <Empty text="기록이 쌓이면 여기에 표시됩니다" />}
+          {timeline.map((w, i) => (
+            <div key={w.id} style={{ display: "flex", gap: 10, padding: "7px 0", borderBottom: i < timeline.length - 1 ? `1px solid ${T.line}` : "none" }}>
+              <div style={{ fontSize: 13, color: T.faint, width: 70, flexShrink: 0 }}>{fmtDateTime(w.ts)}</div>
+              <div style={{ fontSize: 14 }}>
+                <span style={{ color: T.accent, fontSize: 12.5, fontWeight: 700 }}>{CAT_LABEL[w.category] || ""}</span>{" "}
+                <span style={{ fontWeight: 700 }}>{w.type}</span>
+                {w.detail && <span style={{ color: T.sub }}> · {w.detail}</span>}
+                {w.quantity && <span style={{ color: T.sub }}> · {w.quantity}{w.unit}</span>}
+                {w.memo && <span style={{ color: T.faint }}> · {w.memo}</span>}
+              </div>
+            </div>
+          ))}
+        </Card>
+      </div>
+      <Note />
+
+      {editing && <HouseEditModal house={house} update={update} farm={farm} user={user} onClose={() => setEditing(false)} onDeleted={onBack} showToast={showToast} />}
+    </div>
+  );
+}
+
+function Row({ k, v }) {
+  return (
+    <div style={{ display: "flex", justifyContent: "space-between", gap: 12, padding: "9px 0", fontSize: 16, borderBottom: `1px solid ${T.line}55` }}>
+      <span style={{ color: T.sub }}>{k}</span>
+      <span style={{ fontWeight: 700, textAlign: "right" }}>{v}</span>
+    </div>
+  );
+}
+
+function HouseEditModal({ house, update, onClose, showToast, farm, user, onDeleted }) {
+  const [f, setF] = useState({
+    ...house,
+    plantingRounds: plantingRoundsFor(house),
+    bedCount: house.bedCount || "",
+    cellsPerBed: house.cellsPerBed || "",
+  });
+  const set = (k) => (e) => setF((x) => ({ ...x, [k]: e.target.value }));
+  const setPlantingRound = (index, date) => setF((x) => ({
+    ...x,
+    plantingRounds: (x.plantingRounds || []).map((r, i) => i === index ? { round: i + 1, date } : r),
+  }));
+  const addPlantingRound = () => setF((x) => ({
+    ...x,
+    plantingRounds: [...(x.plantingRounds || []), { round: (x.plantingRounds || []).length + 1, date: "" }],
+  }));
+  const removePlantingRound = (index) => setF((x) => ({
+    ...x,
+    plantingRounds: (x.plantingRounds || []).filter((_, i) => i !== index).map((r, i) => ({ ...r, round: i + 1 })),
+  }));
+  const [imgUrl, setImgUrl] = useState(house.flowerImage || null);
+  const [imgBusy, setImgBusy] = useState(false);
+  const [imgStatus, setImgStatus] = useState("");
+  const [showBeds, setShowBeds] = useState(false);
+  const [delMode, setDelMode] = useState(false);
+  const [delPwd, setDelPwd] = useState("");
+  const doDelete = async () => {
+    const expected = farm?.joinPassword || user?.pwd || "";
+    if (!expected) { showToast("농장 비밀번호가 설정되어 있지 않습니다"); return; }
+    if (!(await verifyPwd(delPwd, expected))) { showToast("비밀번호가 맞지 않습니다"); return; }
+    update((s) => ({
+      ...s,
+      houses: s.houses.filter((h) => h.id !== house.id),
+      workLogs: s.workLogs.filter((w) => w.houseId !== house.id),
+      harvestLogs: s.harvestLogs.filter((h) => h.houseId !== house.id),
+      photoLogs: (s.photoLogs || []).filter((p) => p.houseId !== house.id),
+      houseState: Object.fromEntries(Object.entries(s.houseState || {}).filter(([id]) => id !== house.id)),
+      lastSelectedHouseId: s.lastSelectedHouseId === house.id ? null : s.lastSelectedHouseId,
+    }));
+    showToast(`${house.name}을(를) 삭제했습니다`);
+    onClose();
+    if (onDeleted) onDeleted();
+  };
+  const userSetImg = useRef(!!house.flowerImage); // 직접 넣은/저장된 사진이면 자동검색 안 함
+  const rejectedImages = useRef([]);
+
+  const findNextFlowerImage = useCallback(async (name) => {
+    if (!name || userSetImg.current) return;
+    setImgBusy(true);
+    setImgStatus("꽃 사진 후보를 확인하는 중…");
+    const found = await fetchFlowerImage(name, rejectedImages.current);
+    if (found) {
+      setImgUrl(found.url);
+      setImgStatus(`꽃 사진 후보 확인됨 · ${found.title.replace(/^File:/, "")}`);
+    } else {
+      setImgUrl(null);
+      setImgStatus("확실한 꽃 사진을 찾지 못했습니다. 직접 사진을 추가해주세요.");
+    }
+    setImgBusy(false);
+  }, []);
+
+  // 꽃 이름 입력 후 잠시 멈추면 이미지 자동 검색 (사용자가 직접 넣지 않은 경우만)
+  useEffect(() => {
+    const name = (f.flower || "").trim();
+    if (!name || userSetImg.current) { return; }
+    let cancelled = false;
+    rejectedImages.current = [];
+    const t = setTimeout(async () => {
+      if (!cancelled) await findNextFlowerImage(name);
+    }, 700);
+    return () => { cancelled = true; clearTimeout(t); setImgBusy(false); };
+  }, [f.flower, findNextFlowerImage]);
+
+  const save = () => {
+    const plantingRounds = (f.plantingRounds || []).filter((r) => r.date).map((r, i) => ({ round: i + 1, date: r.date }));
+    const normalized = { ...f, plantingRounds, plantingDate: plantingRounds[0]?.date || "" };
+    update((s) => ({
+      ...s,
+      houses: s.houses.map((h) => (h.id === house.id ? { ...h, ...normalized, flowerImage: imgUrl || "", updatedAt: Date.now() } : h)),
+    }));
+    showToast("하우스 정보 저장됨");
+    onClose();
+  };
+
+  if (showBeds) {
+    return <BedGridEditor house={{ ...house, ...f }} onSaveBeds={(beds) => setF((x) => ({ ...x, beds }))}
+      onClose={() => setShowBeds(false)} showToast={showToast} />;
+  }
+
+  const bedCountN = parseInt(f.bedCount) || 0;
+  const cellsN = parseInt(f.cellsPerBed) || 0;
+
+  return (
+    <Modal onClose={onClose} title={`${house.name} 정보`}>
+      <Field label="하우스 이름"><input style={inputStyle} value={f.name} onChange={set("name")} /></Field>
+
+      <Field label="꽃 이름 (직접 입력)">
+        <input style={inputStyle} value={f.flower || ""} onChange={set("flower")} placeholder="예: 리시안셔스, 거베라, 라넌큘러스" />
+        {/* 꽃 이미지: 자동 검색 + 직접 추가 */}
+        <div style={{ marginTop: 8 }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+            {imgBusy && <span style={{ fontSize: 13, color: T.faint }}>꽃 사진인지 확인하며 찾는 중…</span>}
+            {!imgBusy && imgUrl && (
+              <img src={imgUrl} alt={f.flower}
+                onError={() => {
+                  rejectedImages.current.push(imgUrl);
+                  setImgUrl(null);
+                  setImgStatus("사진을 불러오지 못해 다른 꽃 사진을 찾습니다.");
+                  findNextFlowerImage((f.flower || "").trim());
+                }}
+                style={{ width: 64, height: 64, borderRadius: 12, objectFit: "cover", border: `1px solid ${T.line}` }} />
+            )}
+            {!imgBusy && (
+              <div style={{ flex: 1 }}>
+                <label style={{
+                  display: "inline-block", background: T.panel2, border: `1px solid ${T.line}`,
+                  borderRadius: 10, padding: "8px 12px", fontSize: 13, fontWeight: 700, color: T.ink, cursor: "pointer",
+                }}>
+                  📷 사진 직접 추가
+                  <input type="file" accept="image/*" capture="environment" style={{ display: "none" }}
+                    onChange={(ev) => {
+                      const file = ev.target.files?.[0];
+                      if (!file) return;
+                      const reader = new FileReader();
+                      reader.onload = () => { userSetImg.current = true; setImgUrl(reader.result); setImgStatus("직접 추가한 사진입니다."); };
+                      reader.readAsDataURL(file);
+                    }} />
+                </label>
+                {imgUrl && (
+                  <>
+                    <button onClick={() => {
+                      userSetImg.current = false;
+                      if (!String(imgUrl).startsWith("data:")) rejectedImages.current.push(imgUrl);
+                      setImgUrl(null);
+                      findNextFlowerImage((f.flower || "").trim());
+                    }} style={{ marginLeft: 8, background: "none", border: "none", color: T.watch, fontSize: 13, cursor: "pointer", textDecoration: "underline" }}>
+                      꽃사진 아님 · 다시 찾기
+                    </button>
+                    <button onClick={() => { userSetImg.current = false; rejectedImages.current = []; setImgUrl(null); setImgStatus(""); }} style={{ marginLeft: 8, background: "none", border: "none", color: T.faint, fontSize: 13, cursor: "pointer", textDecoration: "underline" }}>사진 지우기</button>
+                  </>
+                )}
+                <div style={{ fontSize: 12.5, color: T.faint, marginTop: 6, lineHeight: 1.5 }}>
+                  {imgStatus || (imgUrl ? "검색 정보로 꽃 사진 여부를 확인한 후보입니다." : "자동으로 못 찾으면 직접 찍거나 골라서 넣으세요.")}
+                </div>
+              </div>
+            )}
+          </div>
+        </div>
+      </Field>
+
+      <div style={{ display: "flex", gap: 8 }}>
+        <Field label="품종"><input style={inputStyle} value={f.variety || ""} onChange={set("variety")} placeholder="레드나오미" /></Field>
+        <Field label="색상"><input style={inputStyle} value={f.color || ""} onChange={set("color")} placeholder="빨강" /></Field>
+      </div>
+
+      <Field label="차수별 모종 심은 날 (정식일)">
+        <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+          {(f.plantingRounds || []).map((r, i) => (
+            <div key={i} style={{ display: "flex", alignItems: "center", gap: 8 }}>
+              <div style={{ width: 42, color: T.accent, fontSize: 13, fontWeight: 800 }}>{i + 1}차</div>
+              <div style={{ flex: 1 }}>
+                <input style={inputStyle} type="date" value={r.date || ""} onChange={(e) => setPlantingRound(i, e.target.value)} />
+                {r.date && <div style={{ color: T.sub, fontSize: 12.5, marginTop: 4 }}>{fmtDateFull(r.date)}</div>}
+              </div>
+              {i > 0 && (
+                <button type="button" onClick={() => removePlantingRound(i)}
+                  style={{ background: "none", border: "none", color: T.danger, cursor: "pointer", fontSize: 13, fontWeight: 700, whiteSpace: "nowrap" }}>삭제</button>
+              )}
+            </div>
+          ))}
+          {(f.plantingRounds || []).length === 0 && (
+            <Btn kind="ghost" onClick={addPlantingRound} style={{ width: "100%" }}>+ 1차 정식일 입력</Btn>
+          )}
+          {(f.plantingRounds || []).length > 0 && (
+            <Btn kind="ghost" onClick={addPlantingRound} style={{ width: "100%" }}>+ {(f.plantingRounds || []).length + 1}차 정식일 추가</Btn>
+          )}
+        </div>
+      </Field>
+      <Field label="묘종 입고일"><input style={inputStyle} type="date" value={f.seedlingDate || ""} onChange={set("seedlingDate")} /></Field>
+      <div style={{ fontSize: 12.5, color: T.faint, marginTop: -4, marginBottom: 12, lineHeight: 1.5 }}>
+        모종 심은 날을 넣으면 꽃 이름별 생육기간을 적용하고, 실제 날씨와 관수 기록이 쌓일수록 예상 개화일을 자동 보정합니다.
+      </div>
+
+      <div style={{ display: "flex", gap: 8 }}>
+        <Field label="예상 총 수확량"><input style={inputStyle} type="number" value={f.expectedTotal || ""} onChange={set("expectedTotal")} placeholder="1200" /></Field>
+        <Field label="단위"><input style={inputStyle} value={f.unit || ""} onChange={set("unit")} placeholder="송이" /></Field>
+      </div>
+
+      {/* 두둑 설정 */}
+      <div style={{ height: 1, background: T.line, margin: "8px 0 14px" }} />
+      <div style={{ fontSize: 13, fontWeight: 800, color: T.sub, marginBottom: 8 }}>두둑 설정</div>
+      <div style={{ display: "flex", gap: 8 }}>
+        <Field label="두둑 수 (가로로 몇 개)"><input style={inputStyle} type="number" value={f.bedCount} onChange={set("bedCount")} placeholder="예: 3" /></Field>
+        <Field label="두둑당 칸 수 (세로)"><input style={inputStyle} type="number" value={f.cellsPerBed} onChange={set("cellsPerBed")} placeholder="예: 14" /></Field>
+      </div>
+      <div style={{ fontSize: 12.5, color: T.faint, marginBottom: 10, lineHeight: 1.5 }}>
+        칸 하나는 실제 작은 칸 여러 개(약 10칸)를 묶은 단위입니다. 예: 3두둑 × 14칸.
+      </div>
+      {bedCountN > 0 && cellsN > 0 && (
+        <Btn kind="ghost" onClick={() => setShowBeds(true)} style={{ width: "100%", marginBottom: 12 }}>
+          🌱 두둑 격자에서 칸별 꽃 지정 ({bedCountN}두둑 × {cellsN}칸)
+        </Btn>
+      )}
+
+      <Btn kind="primary" onClick={save} style={{ width: "100%" }}>저장</Btn>
+
+      {/* 위험 구역 — 하우스 삭제 (비밀번호 확인 + 관련 기록 연쇄 정리) */}
+      <div style={{ height: 1, background: T.line, margin: "20px 0 12px" }} />
+      {!delMode ? (
+        <Btn kind="danger" onClick={() => setDelMode(true)} style={{ width: "100%" }}>이 하우스 삭제</Btn>
+      ) : (
+        <div style={{ padding: 14, background: T.danger + "12", border: `1px solid ${T.danger}55`, borderRadius: 12 }}>
+          <div style={{ fontSize: 15, color: T.ink, fontWeight: 700, lineHeight: 1.6, marginBottom: 6 }}>
+            {house.name}을(를) 삭제하면 이 하우스의 작업·수확·사진·상태 기록이 모두 함께 삭제됩니다.
+          </div>
+          <div style={{ fontSize: 13, color: T.sub, lineHeight: 1.6, marginBottom: 10 }}>
+            되돌릴 수 없습니다. 확인하려면 농장 비밀번호를 입력하세요. (출하 기록은 특정 하우스에 묶여 있지 않아 그대로 남습니다.)
+          </div>
+          <input style={inputStyle} type="password" value={delPwd} onChange={(e) => setDelPwd(e.target.value)} placeholder="농장 비밀번호" autoFocus />
+          <div style={{ display: "flex", gap: 8, marginTop: 10 }}>
+            <Btn kind="plain" onClick={() => { setDelMode(false); setDelPwd(""); }} style={{ flex: 1 }}>취소</Btn>
+            <Btn kind="danger" onClick={doDelete} style={{ flex: 1 }}>비밀번호 확인 · 삭제</Btn>
+          </div>
+        </div>
+      )}
+    </Modal>
+  );
+}
+
+/* 두둑 격자 편집기: beds = { "bedIndex-cellIndex": {flower,color,plantingRound} } */
+function BedGridEditor({ house, onSaveBeds, onClose, showToast }) {
+  const bedCount = parseInt(house.bedCount) || 0;
+  const cells = parseInt(house.cellsPerBed) || 0;
+  const [beds, setBeds] = useState(house.beds || {});
+  const plantingRounds = plantingRoundsFor(house);
+  const [brush, setBrush] = useState({ flower: house.flower || "", color: house.color || "", plantingRound: plantingRounds[0]?.round || 1 });
+  const [eraser, setEraser] = useState(false);
+  const painting = useRef(false);
+  const brushRef = useRef(brush);
+  const eraserRef = useRef(eraser);
+  brushRef.current = brush;
+  eraserRef.current = eraser;
+
+  const key = (b, c) => `${b}-${c}`;
+  const applyCell = (b, c) => {
+    const k = key(b, c);
+    setBeds((prev) => {
+      const next = { ...prev };
+      if (eraserRef.current) delete next[k];
+      else next[k] = { flower: brushRef.current.flower, color: brushRef.current.color, plantingRound: brushRef.current.plantingRound };
+      return next;
+    });
+  };
+  const fillBed = (b) => {
+    setBeds((prev) => {
+      const next = { ...prev };
+      for (let c = 0; c < cells; c++) {
+        const k = key(b, c);
+        if (eraserRef.current) delete next[k];
+        else next[k] = { flower: brushRef.current.flower, color: brushRef.current.color, plantingRound: brushRef.current.plantingRound };
+      }
+      return next;
+    });
+  };
+
+  // 드래그: 포인터 위치의 칸을 찾아 칠한다 (마우스+터치 공용)
+  const paintAtPoint = (clientX, clientY) => {
+    const el = document.elementFromPoint(clientX, clientY);
+    if (el && el.dataset && el.dataset.bed != null && el.dataset.cell != null) {
+      applyCell(Number(el.dataset.bed), Number(el.dataset.cell));
+    }
+  };
+  const onPointerDown = (e) => {
+    painting.current = true;
+    paintAtPoint(e.clientX, e.clientY);
+  };
+  const onPointerMove = (e) => {
+    if (!painting.current) return;
+    e.preventDefault();
+    paintAtPoint(e.clientX, e.clientY);
+  };
+  const stop = () => { painting.current = false; };
+
+  const save = () => { onSaveBeds(beds); showToast("두둑 배치 저장됨 (하우스 저장도 눌러주세요)"); onClose(); };
+
+  const counts = {};
+  Object.values(beds).forEach((v) => { if (v.flower) counts[v.flower] = (counts[v.flower] || 0) + 1; });
+
+  return (
+    <Modal onClose={onClose} title={`${house.name} · 두둑 배치`}>
+      <div style={{ fontSize: 13, color: T.sub, marginBottom: 12, lineHeight: 1.6 }}>
+        칠할 꽃·색·정식 차수를 정한 뒤, 격자를 <b style={{ color: T.accent }}>손가락으로 쭉 끌면</b> 따라 지정됩니다.
+      </div>
+
+      <div style={{ display: "flex", gap: 8, marginBottom: 8 }}>
+        <input style={{ ...inputStyle, flex: 2 }} value={brush.flower} onChange={(e) => { setBrush({ ...brush, flower: e.target.value }); setEraser(false); }} placeholder="칠할 꽃" />
+        <input style={{ ...inputStyle, flex: 1 }} value={brush.color} onChange={(e) => { setBrush({ ...brush, color: e.target.value }); setEraser(false); }} placeholder="색상" />
+      </div>
+      <div style={{ display: "flex", gap: 6, marginBottom: 14, flexWrap: "wrap" }}>
+        {Object.keys(COLOR_HEX).filter((c, i, a) => a.findIndex((x) => COLOR_HEX[x] === COLOR_HEX[c]) === i).slice(0, 8).map((c) => (
+          <button key={c} onClick={() => { setBrush({ ...brush, color: c }); setEraser(false); }}
+            title={c} style={{ width: 26, height: 26, borderRadius: 8, background: COLOR_HEX[c], border: brush.color === c ? `2px solid ${T.ink}` : `1px solid ${T.line}`, cursor: "pointer" }} />
+        ))}
+        <Chip active={eraser} color={T.danger} onClick={() => setEraser(!eraser)}>지우개</Chip>
+      </div>
+      <div style={{ marginBottom: 14 }}>
+        <div style={{ fontSize: 13, color: T.sub, fontWeight: 800, marginBottom: 7 }}>정식 차수</div>
+        <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+          {plantingRounds.map((r) => (
+            <Chip key={r.round} active={brush.plantingRound === r.round} color="#E78AB5"
+              onClick={() => { setBrush({ ...brush, plantingRound: r.round }); setEraser(false); }}>
+              {r.round}차 정식 · {fmtDate(r.date)}
+            </Chip>
+          ))}
+          {plantingRounds.length === 0 && <span style={{ color: T.caution, fontSize: 12 }}>하우스 정보에서 정식일을 먼저 등록하세요.</span>}
+        </div>
+      </div>
+
+      {/* 격자 — 드래그 색칠 */}
+      <div
+        onPointerDown={onPointerDown}
+        onPointerMove={onPointerMove}
+        onPointerUp={stop}
+        onPointerLeave={stop}
+        onPointerCancel={stop}
+        style={{ display: "flex", gap: 8, justifyContent: "center", marginBottom: 14, overflowX: "auto", paddingBottom: 4, touchAction: "none", userSelect: "none" }}
+      >
+        {Array.from({ length: bedCount }).map((_, b) => (
+          <div key={b} style={{ flex: "0 0 auto", minWidth: 54 }}>
+            <button onClick={() => fillBed(b)}
+              style={{ width: "100%", fontSize: 12.5, fontWeight: 700, color: T.sub, background: T.panel2, border: `1px solid ${T.line}`, borderRadius: 6, padding: "4px 0", marginBottom: 4, cursor: "pointer" }}>
+              {b + 1}두둑
+            </button>
+            <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
+              {Array.from({ length: cells }).map((_, c) => {
+                const cell = beds[key(b, c)];
+                const bg = cell ? (colorHex(cell.color) || T.accent) : "transparent";
+                return (
+                  <div key={c} data-bed={b} data-cell={c}
+                    title={cell ? `${cell.flower || ""} ${cell.color || ""} · ${Math.min(cell.plantingRound || 1, plantingRoundsFor(house).length || 1)}차 정식` : "비어있음"}
+                    style={{
+                      height: 26, borderRadius: 4,
+                      background: cell ? bg : T.panel,
+                      border: cell ? `1px solid ${T.line}` : `1px dashed ${T.line}`,
+                      cursor: "pointer", padding: 0, display: "flex", alignItems: "center",
+                      justifyContent: "center", color: cell ? T.accentInk : T.faint,
+                      fontSize: 9, fontWeight: 900,
+                    }}>
+                    {cell ? `${Math.min(cell.plantingRound || 1, plantingRoundsFor(house).length || 1)}차` : ""}
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        ))}
+      </div>
+
+      {Object.keys(counts).length > 0 && (
+        <div style={{ fontSize: 13, color: T.sub, marginBottom: 12, lineHeight: 1.7 }}>
+          {Object.entries(counts).map(([fl, n]) => (
+            <span key={fl} style={{ marginRight: 12 }}>{fl}: {n}칸</span>
+          ))}
+        </div>
+      )}
+
+      <Btn kind="primary" onClick={save} style={{ width: "100%" }}>배치 저장</Btn>
+    </Modal>
+  );
+}
+
+/* ===================== 과거 기록 대시보드 =========================== */
+const CAT_LABEL = {
+  watering: "관수", facility: "시설", pesticide: "농약", photo: "사진", flowering: "개화",
+  harvest: "수확", damage: "피해", disease_pest: "병해", memo: "메모", shipment: "출하",
+  preparation: "재배준비", planting: "정식", growth_management: "생육관리", nutrient: "양분",
+};
+function HistoryScreen({ state, update, farm, setDetailHouseId, showToast, weather }) {
+  const houses = state.houses.filter((h) => h.farmId === farm.id).sort((a, b) => a.number - b.number);
+  const [catFilter, setCatFilter] = useState("all");
+  const [period, setPeriod] = useState(30);
+  const [editLog, setEditLog] = useState(null);
+  const [expanded, setExpanded] = useState(null); // 펼친 하우스 id
+
+  const ctx = { workLogs: state.workLogs, harvestLogs: state.harvestLogs, houseState: state.houseState, weatherHistory: state.weatherHistory, weather: weather || {} };
+
+  const logsForHouse = (houseId) =>
+    state.workLogs
+      .filter((w) => w.farmId === farm.id && w.houseId === houseId)
+      .filter((w) => catFilter === "all" || w.category === catFilter)
+      .filter((w) => daysAgo(w.ts) === null || daysAgo(w.ts) <= period)
+      .sort((a, b) => b.ts - a.ts)
+      .slice(0, 100);
+
+  const houseName = (id) => houses.find((h) => h.id === id)?.name || "—";
+
+  const addHouse = () => {
+    const start = houses.reduce((m, h) => Math.max(m, h.number), 0);
+    const id = uid();
+    update((s) => ({ ...s, houses: [...s.houses, { id, farmId: farm.id, number: start + 1, name: `${start + 1}동`, flower: "", variety: "", color: "", plantingDate: "", seedlingDate: "", expectedTotal: "", unit: "송이", lat: null, lng: null, qr: `FHM-${start + 1}`, memo: "" }] }));
+    showToast(`${start + 1}동이 추가되었습니다`);
+    setDetailHouseId(id);
+  };
+
+  return (
+    <div>
+      <div style={{ display: "flex", alignItems: "flex-end", justifyContent: "space-between", padding: "18px 18px 12px" }}>
+        <div>
+          <div style={{ fontSize: 22, fontWeight: 800, letterSpacing: -0.5 }}>하우스</div>
+          <div style={{ color: T.sub, fontSize: 13, marginTop: 3 }}>하우스를 누르면 정보·기록·편집을 한 곳에서</div>
+        </div>
+        <Btn kind="primary" onClick={addHouse} style={{ padding: "11px 16px", fontSize: 15 }}>+ 하우스 추가</Btn>
+      </div>
+
+      <div style={{ padding: "0 14px 6px", display: "flex", gap: 6, overflowX: "auto" }}>
+        <Chip active={catFilter === "all"} color={T.ok} onClick={() => setCatFilter("all")}>전체 작업</Chip>
+        {["watering", "pesticide", "facility", "preparation", "planting", "growth_management", "nutrient", "disease_pest", "harvest", "flowering", "photo", "damage"].map((c) => (
+          <Chip key={c} active={catFilter === c} color={T.ok} onClick={() => setCatFilter(c)}>{CAT_LABEL[c]}</Chip>
+        ))}
+      </div>
+      <div style={{ padding: "0 14px 12px", display: "flex", gap: 6 }}>
+        {[[7, "7일"], [30, "30일"], [365, "전체"]].map(([d, l]) => (
+          <Chip key={d} active={period === d} color={T.caution} onClick={() => setPeriod(d)}>{l}</Chip>
+        ))}
+      </div>
+
+      <div style={{ padding: "0 14px" }}>
+        {houses.map((h) => {
+          const e = computeHouseEstimate(h, ctx);
+          const hLogs = logsForHouse(h.id);
+          const isOpen = expanded === h.id;
+          const hs = state.houseState[h.id] || {};
+          const lastLog = hLogs[0];
+          return (
+            <div key={h.id} style={{ marginBottom: 12, border: `1px solid ${T.line}`, borderRadius: 16, overflow: "hidden", background: T.panel }}>
+              {/* 하우스 헤더 (비닐하우스 모양) */}
+              <button onClick={() => setExpanded(isOpen ? null : h.id)}
+                style={{ width: "100%", display: "flex", alignItems: "center", gap: 12, padding: "12px 14px", background: "none", border: "none", color: T.ink, cursor: "pointer", textAlign: "left" }}>
+                <HouseShape number={h.number} status={e.status} flowerColor={colorHex(h.color)} width={84} open={hs.vent === "open"} beds={parseInt(h.bedCount) || 0} />
+                <div style={{ flex: 1 }}>
+                  <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                    <span style={{ fontWeight: 800, fontSize: 16 }}>{h.name}</span>
+                    <span style={{ color: T.sub, fontSize: 13 }}>{h.flower || "미등록"}</span>
+                    {h.color && <span style={{ color: T.faint, fontSize: 12 }}>· {h.color}</span>}
+                  </div>
+                  <div style={{ fontSize: 13, color: T.sub, marginTop: 3 }}>
+                    기록 {hLogs.length}건
+                    {lastLog && <span style={{ color: T.faint }}> · 최근 {fmtDate(lastLog.ts)} {lastLog.type}</span>}
+                  </div>
+                </div>
+                <span style={{ color: T.faint, fontSize: 18 }}>{isOpen ? "−" : "+"}</span>
+              </button>
+
+              {/* 펼친 기록 */}
+              {isOpen && (
+                <div style={{ borderTop: `1px solid ${T.line}` }}>
+                  {hLogs.map((w, i) => (
+                    <div key={w.id} onClick={() => setEditLog(w)}
+                      style={{ display: "flex", gap: 10, padding: "10px 14px", borderBottom: i < hLogs.length - 1 ? `1px solid ${T.line}55` : "none", cursor: "pointer", alignItems: "center" }}>
+                      <div style={{ fontSize: 13, color: T.faint, width: 64, flexShrink: 0 }}>{fmtDateTime(w.ts)}</div>
+                      <div style={{ flex: 1, fontSize: 14 }}>
+                        <span style={{ color: T.accent, fontSize: 13, fontWeight: 700 }}>{CAT_LABEL[w.category] || w.category}</span>{" "}
+                        <span>{w.type}</span>
+                        {w.detail && <span style={{ color: T.sub }}> · {w.detail}</span>}
+                        {w.quantity && <span style={{ color: T.sub }}> · {w.quantity}{w.unit}</span>}
+                        {w.memo && <span style={{ color: T.faint }}> · {w.memo}</span>}
+                      </div>
+                      <span style={{ color: T.faint, fontSize: 14 }}>›</span>
+                    </div>
+                  ))}
+                  {hLogs.length === 0 && <Empty text="이 하우스에 해당 기록이 없습니다" />}
+                  <div style={{ padding: "10px 14px", display: "flex", gap: 8 }}>
+                    <Btn kind="ghost" onClick={() => setDetailHouseId(h.id)} style={{ flex: 1, padding: "10px", fontSize: 13 }}>상세 보기</Btn>
+                    <Btn kind="primary" onClick={() => setDetailHouseId(h.id)} style={{ flex: 1, padding: "10px", fontSize: 13 }}>정보·편집</Btn>
+                  </div>
+                </div>
+              )}
+            </div>
+          );
+        })}
+        {houses.length === 0 && <Card><Empty text="하우스를 먼저 추가하세요 (설정 탭)" /></Card>}
+      </div>
+      <div style={{ height: 20 }} />
+
+      {editLog && (
+        <WorkLogEditModal log={editLog} houseName={houseName(editLog.houseId)} update={update}
+          onClose={() => setEditLog(null)} showToast={showToast}
+          onViewHouse={() => { const id = editLog.houseId; setEditLog(null); setDetailHouseId(id); }} />
+      )}
+    </div>
+  );
+}
+
+/* 작업 기록 수정/삭제 */
+function WorkLogEditModal({ log, houseName, update, onClose, showToast, onViewHouse }) {
+  const [type, setType] = useState(log.type || "");
+  const [detail, setDetail] = useState(log.detail || "");
+  const [quantity, setQuantity] = useState(log.quantity || "");
+  const [memo, setMemo] = useState(log.memo || "");
+  // 날짜/시간 입력용 (datetime-local 형식)
+  const toLocal = (ts) => {
+    const d = new Date(ts);
+    const p = (n) => String(n).padStart(2, "0");
+    return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}T${p(d.getHours())}:${p(d.getMinutes())}`;
+  };
+  const [when, setWhen] = useState(toLocal(log.ts));
+
+  const save = () => {
+    const newTs = new Date(when).getTime() || log.ts;
+    update((s) => ({
+      ...s,
+      workLogs: s.workLogs.map((w) => w.id === log.id
+        ? { ...w, type, detail, quantity, memo, ts: newTs, updatedAt: Date.now() }
+        : w),
+    }));
+    showToast("기록을 수정했습니다");
+    onClose();
+  };
+  const del = () => {
+    update((s) => ({ ...s, workLogs: s.workLogs.filter((w) => w.id !== log.id) }));
+    showToast("기록을 삭제했습니다");
+    onClose();
+  };
+
+  return (
+    <Modal onClose={onClose} title={`${houseName} · 기록 수정`}>
+      <div style={{ fontSize: 13, color: T.accent, fontWeight: 700, marginBottom: 12 }}>{CAT_LABEL[log.category] || log.category}</div>
+      <Field label="작업 이름"><input style={inputStyle} value={type} onChange={(e) => setType(e.target.value)} /></Field>
+      <Field label="날짜·시간"><input style={{ ...inputStyle, appearance: "auto" }} type="datetime-local" value={when} onChange={(e) => setWhen(e.target.value)} /></Field>
+      <div style={{ display: "flex", gap: 8 }}>
+        <Field label="수량"><input style={inputStyle} value={quantity} onChange={(e) => setQuantity(e.target.value)} placeholder="(선택)" /></Field>
+        <Field label="상세"><input style={inputStyle} value={detail} onChange={(e) => setDetail(e.target.value)} placeholder="(선택)" /></Field>
+      </div>
+      <Field label="메모"><input style={inputStyle} value={memo} onChange={(e) => setMemo(e.target.value)} placeholder="(선택)" /></Field>
+      <Btn kind="primary" onClick={save} style={{ width: "100%", marginBottom: 8 }}>수정 저장</Btn>
+      <div style={{ display: "flex", gap: 8 }}>
+        <Btn kind="ghost" onClick={onViewHouse} style={{ flex: 1 }}>하우스 보기</Btn>
+        <Btn kind="danger" onClick={del} style={{ flex: 1 }}>이 기록 삭제</Btn>
+      </div>
+    </Modal>
+  );
+}
+
+/* ===================== 설정 화면 ==================================== */
+/* ===================== 꽃 정보 추가 패널 ======================== */
+const FLOWER_ADD_PROMPT = `아래 JSON 형식으로 "[꽃이름]"의 시설 화훼 재배(비닐하우스) 정보를 작성해 주세요.
+반드시 JSON만, 코드블록(\`\`\`) 없이 순수 JSON으로 답해 주세요.
+수치 필드에 주석·설명 없이 숫자 값만 넣어 주세요.
+
+{
+  "name": "[꽃이름]",
+  "aliases": ["[꽃이름]", "영어명 또는 학명"],
+  "profile": {
+    "heat": 0.8,
+    "humidity": 0.7,
+    "water": 2,
+    "bloomDays": [60, 90],
+    "cutOffset": -1,
+    "optimum": [16, 24],
+    "sens": "가장 주의할 병·해충 1~2가지"
+  },
+  "prevention": {
+    "source": "정보 출처(예: 농촌진흥청 재배매뉴얼)",
+    "pests": ["해충명1", "해충명2"],
+    "diseases": ["병명1", "병명2"],
+    "caution": "재배 핵심 주의사항 2~3문장",
+    "generalPrevention": ["예방수칙1", "예방수칙2", "예방수칙3"]
+  }
+}
+
+필드 설명:
+- heat: 고온 민감도 0~1 소수 (고온에 약할수록 높음)
+- humidity: 고습 병 위험도 0~1 소수
+- water: 물 요구도 정수 (1=절수, 2=보통, 3=다수분)
+- bloomDays: [정식→개화 최소일, 최대일] 정수 배열
+- cutOffset: 절화적기 정수 (-2~1, 만개 기준 전이면 음수)
+- optimum: [생육 최저°C, 최고°C] 정수 배열`;
+
+function FlowerAddPanel({ user, state, update, showToast }) {
+  const [open, setOpen] = useState(false);
+  const [jsonText, setJsonText] = useState("");
+
+  const userCustom = (state.customFlowers && user && state.customFlowers[user.id]) || {};
+  const customList = Object.entries(userCustom);
+
+  const copyPrompt = () => {
+    try {
+      if (navigator.clipboard) {
+        navigator.clipboard.writeText(FLOWER_ADD_PROMPT)
+          .then(() => showToast("프롬프트 복사됨 · GPT/제미나이에 붙여넣기 후 꽃 이름만 바꿔 보내세요"))
+          .catch(() => showToast("복사 실패 — 아래 텍스트를 직접 선택해 복사하세요"));
+      } else showToast("복사 실패 — 직접 선택해 복사하세요");
+    } catch (e) { showToast("복사 실패"); }
+  };
+
+  const doImport = () => {
+    let parsed;
+    try { parsed = JSON.parse(jsonText.trim()); }
+    catch (e) { return showToast("JSON 형식이 올바르지 않습니다"); }
+
+    const name = parsed.name;
+    if (!name || typeof name !== "string") return showToast("name 필드가 없습니다");
+    if (!parsed.profile || typeof parsed.profile !== "object") return showToast("profile 필드가 없습니다");
+
+    const entry = {
+      aliases: Array.isArray(parsed.aliases) ? parsed.aliases : [name],
+      profile: {
+        heat: Number(parsed.profile.heat) || 0.8,
+        humidity: Number(parsed.profile.humidity) || 0.8,
+        water: Number(parsed.profile.water) || 2,
+        bloomDays: Array.isArray(parsed.profile.bloomDays) ? parsed.profile.bloomDays : [75, 110],
+        cutOffset: parsed.profile.cutOffset !== undefined ? Number(parsed.profile.cutOffset) : -1,
+        optimum: Array.isArray(parsed.profile.optimum) ? parsed.profile.optimum : [17, 25],
+        sens: String(parsed.profile.sens || "—"),
+      },
+      prevention: parsed.prevention ? {
+        source: parsed.prevention.source || "",
+        pests: Array.isArray(parsed.prevention.pests) ? parsed.prevention.pests : [],
+        diseases: Array.isArray(parsed.prevention.diseases) ? parsed.prevention.diseases : [],
+        caution: parsed.prevention.caution || "",
+        generalPrevention: Array.isArray(parsed.prevention.generalPrevention) ? parsed.prevention.generalPrevention : [],
+      } : null,
+      addedAt: localISODate(),
+    };
+
+    update((s) => ({
+      ...s,
+      customFlowers: {
+        ...s.customFlowers,
+        [user.id]: { ...(s.customFlowers[user.id] || {}), [name]: entry },
+      },
+    }));
+    setJsonText("");
+    setOpen(false);
+    showToast(`"${name}" 꽃 정보 추가됨`);
+  };
+
+  const deleteCustom = (key) => {
+    update((s) => {
+      const userFlowers = { ...(s.customFlowers[user.id] || {}) };
+      delete userFlowers[key];
+      return { ...s, customFlowers: { ...s.customFlowers, [user.id]: userFlowers } };
+    });
+    showToast(`"${key}" 삭제됨`);
+  };
+
+  return (
+    <div>
+      {customList.length > 0 && (
+        <div style={{ marginBottom: 14 }}>
+          <div style={{ fontSize: 13, color: T.sub, marginBottom: 8, fontWeight: 700 }}>내가 추가한 꽃 ({customList.length}종)</div>
+          {customList.map(([key, val]) => (
+            <div key={key} style={{ display: "flex", alignItems: "center", justifyContent: "space-between", background: T.panel2, border: `1px solid ${T.line}`, borderRadius: 10, padding: "10px 14px", marginBottom: 6 }}>
+              <div>
+                <span style={{ fontWeight: 800, fontSize: 15 }}>{key}</span>
+                <span style={{ marginLeft: 7, background: T.accent, color: T.accentInk, borderRadius: 6, fontSize: 11, padding: "2px 7px", fontWeight: 800 }}>추가</span>
+                {val.addedAt && <span style={{ fontSize: 12, color: T.faint, marginLeft: 8 }}>{val.addedAt}</span>}
+              </div>
+              <button onClick={() => deleteCustom(key)}
+                style={{ background: "transparent", border: "none", color: T.danger, fontSize: 20, cursor: "pointer", padding: "0 4px", lineHeight: 1 }}>
+                ✕
+              </button>
+            </div>
+          ))}
+        </div>
+      )}
+
+      <Btn kind={open ? "ghost" : "primary"} onClick={() => setOpen((v) => !v)} style={{ width: "100%", marginBottom: open ? 12 : 0 }}>
+        {open ? "닫기" : "+ 꽃 정보 추가하기"}
+      </Btn>
+
+      {open && (
+        <div>
+          <div style={{ fontSize: 14, color: T.sub, lineHeight: 1.8, marginBottom: 12 }}>
+            <b style={{ color: T.ink }}>방법:</b><br />
+            ① 아래 <b style={{ color: T.accent }}>복사하기</b> → GPT·제미나이에 붙여넣기<br />
+            ② 프롬프트에서 <b style={{ color: T.accent }}>[꽃이름]</b>만 원하는 꽃 이름으로 바꾸고 보내기<br />
+            ③ 받은 JSON 전체를 아래 칸에 붙여넣기 → <b style={{ color: T.accent }}>값 넣기</b>
+          </div>
+
+          <Btn kind="primary" onClick={copyPrompt} style={{ width: "100%", marginBottom: 10 }}>
+            📋 복사하기 (GPT·제미나이용 프롬프트)
+          </Btn>
+
+          <textarea
+            value={jsonText}
+            onChange={(e) => setJsonText(e.target.value)}
+            placeholder={"GPT·제미나이가 답한 JSON을 여기에 붙여넣기 하세요\n(코드블록 ``` 없이 순수 JSON만)"}
+            style={{ ...inputStyle, minHeight: 150, fontSize: 13.5, fontFamily: "monospace", resize: "vertical", marginBottom: 8 }}
+          />
+
+          <Btn kind="primary" onClick={doImport} style={{ width: "100%" }}>
+            값 넣기
+          </Btn>
+
+          <div style={{ fontSize: 12.5, color: T.faint, marginTop: 10, lineHeight: 1.6 }}>
+            추가된 꽃은 이 계정에만 저장됩니다. 하우스에 꽃 이름 입력 시 자동으로 인식되며, 병해충 예방 체크리스트에도 반영됩니다.
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function SettingsScreen({ state, update, user, farm, showToast }) {
+  const houses = state.houses.filter((h) => h.farmId === farm.id);
+  const [addCount, setAddCount] = useState("");
+  const [sido, setSido] = useState("");
+  const [geoBusy, setGeoBusy] = useState(false);
+  const [gpsStatus, setGpsStatus] = useState("");
+  const [shareMode, setShareMode] = useState(null); // null | "out" | "in"
+  const [shareCode, setShareCode] = useState("");
+  const [importText, setImportText] = useState("");
+
+  const setMorning = (time) => update((s) => ({ ...s, settings: { ...s.settings, morningTime: time, morningEnabled: time !== "off" } }));
+
+  // 공유 코드 내보내기
+  const doExport = () => {
+    const payload = buildSharePayload(state, farm.id);
+    const code = JSON.stringify(payload);
+    setShareCode(code);
+    setShareMode("out");
+    // 클립보드 복사 시도
+    try {
+      if (navigator.clipboard) navigator.clipboard.writeText(code).then(() => showToast("공유 코드가 복사되었습니다")).catch(() => {});
+    } catch (e) {}
+  };
+
+  const copyCode = () => {
+    try {
+      if (navigator.clipboard) { navigator.clipboard.writeText(shareCode); showToast("복사됨 · 카톡으로 붙여넣어 보내세요"); }
+      else showToast("아래 코드를 길게 눌러 복사하세요");
+    } catch (e) { showToast("아래 코드를 길게 눌러 복사하세요"); }
+  };
+
+  // 가져와서 합치기
+  const doImport = () => {
+    let incoming;
+    try {
+      incoming = JSON.parse(importText.trim());
+    } catch (e) {
+      return showToast("코드 형식이 올바르지 않습니다");
+    }
+    if (!incoming || incoming.fhmShare !== 1 || !incoming.farm) {
+      return showToast("화훼 하우스 매니저 공유 코드가 아닙니다");
+    }
+    update((s) => {
+      // 들어온 농장이 내게 없으면 farm/houses를 추가, 있으면 같은 farmId로 병합
+      const localFarmId = farm.id;
+      const incomingFarmId = incoming.farm.id;
+      // 들어온 데이터의 farmId를 내 농장 id로 통일 (한 농장 공유 전제)
+      const remap = (arr) => (arr || []).map((x) => ({ ...x, farmId: localFarmId }));
+      const incomingNormalized = {
+        farms: [], // 농장 메타는 로컬 유지
+        houses: remap(incoming.houses),
+        workLogs: remap(incoming.workLogs),
+        harvestLogs: remap(incoming.harvestLogs),
+        shipments: remap(incoming.shipments),
+        photoLogs: remap(incoming.photoLogs),
+        destinations: remap(incoming.destinations),
+        boxTemplates: remap(incoming.boxTemplates),
+        houseState: incoming.houseState || {},
+      };
+      return mergeFarmData(s, incomingNormalized);
+    });
+    setImportText("");
+    setShareMode(null);
+    showToast("상대방 기록을 합쳤습니다 · 양쪽 데이터 모두 유지됨");
+  };
+
+  const pickGugun = (sidoName, g) => {
+    const [name, lat, lng] = g;
+    const label = `${sidoName} ${name}`.replace(" 전역", "");
+    update((s) => ({
+      ...s,
+      farms: s.farms.map((f) => (f.id === farm.id ? { ...f, region: label, lat, lng, gpsAccuracy: null } : f)),
+    }));
+    setSido("");
+    showToast(`${label} 위치 등록됨 · 실시간 날씨 적용`);
+  };
+
+  const useGPS = () => {
+    if (!navigator.geolocation) return showToast("이 기기는 위치 기능을 지원하지 않습니다");
+    setGeoBusy(true);
+    setGpsStatus("위치를 확인하는 중… (하늘이 보이는 곳에서 더 정확합니다)");
+    navigator.geolocation.getCurrentPosition(
+      (pos) => {
+        const { latitude, longitude, accuracy } = pos.coords;
+        const acc = Math.round(accuracy);
+        update((s) => ({
+          ...s,
+          farms: s.farms.map((f) =>
+            f.id === farm.id
+              ? { ...f, lat: latitude, lng: longitude, gpsAccuracy: acc, region: f.region && f.region !== "현재 위치" ? f.region : "GPS 등록 위치" }
+              : f
+          ),
+        }));
+        setGeoBusy(false);
+        if (acc <= 20) {
+          setGpsStatus(`✓ 정밀하게 등록됨 (정확도 ±${acc}m)`);
+          showToast(`정밀 위치 등록 완료 · 정확도 ±${acc}m`);
+        } else if (acc <= 100) {
+          setGpsStatus(`등록됨 (정확도 ±${acc}m) — 더 정밀하게 하려면 야외에서 다시 누르세요`);
+          showToast(`위치 등록됨 · 정확도 ±${acc}m`);
+        } else {
+          setGpsStatus(`등록됐지만 정확도가 낮습니다 (±${acc}m). 하우스 밖 하늘이 트인 곳에서 다시 눌러보세요`);
+          showToast(`위치 등록됨 · 정확도 ±${acc}m (재시도 권장)`);
+        }
+      },
+      (err) => {
+        setGeoBusy(false);
+        if (err.code === 1) setGpsStatus("위치 권한이 거부되었습니다. 브라우저 설정에서 위치 권한을 허용해주세요.");
+        else if (err.code === 3) setGpsStatus("위치 확인 시간이 초과됐습니다. 야외에서 다시 시도해주세요.");
+        else setGpsStatus("위치를 가져오지 못했습니다. 다시 시도해주세요.");
+        showToast("위치를 가져오지 못했습니다");
+      },
+      { enableHighAccuracy: true, timeout: 15000, maximumAge: 0 }
+    );
+  };
+
+  const addHouses = () => {
+    const n = parseInt(addCount) || 0;
+    if (n <= 0) return;
+    const start = houses.reduce((m, h) => Math.max(m, h.number), 0);
+    const newHouses = Array.from({ length: n }, (_, i) => ({
+      id: uid(), farmId: farm.id, number: start + i + 1, name: `${start + i + 1}동`, flower: "", variety: "", color: "",
+      plantingDate: "", seedlingDate: "", expectedTotal: "", unit: "송이", lat: null, lng: null, qr: `FHM-${start + i + 1}`, memo: "",
+    }));
+    update((s) => ({ ...s, houses: [...s.houses, ...newHouses] }));
+    setAddCount("");
+    showToast(`${n}개 하우스 추가됨`);
+  };
+  const logout = () => update((s) => ({ ...s, session: null, activeFarmId: null }));
+
+  // ---- 자동 동기화 코드 설정 ----
+  const [syncInput, setSyncInput] = useState(farm.syncCode || "");
+  const syncConfigured = typeof window !== "undefined" && window.firebaseApi && !String((typeof FIREBASE_CONFIG !== "undefined" ? FIREBASE_CONFIG.apiKey : "여기에")).startsWith("여기에");
+  const genCode = () => {
+    const c = "FARM-" + Math.random().toString(36).slice(2, 7).toUpperCase();
+    setSyncInput(c);
+  };
+  const saveSyncCode = () => {
+    const code = syncInput.trim().toUpperCase();
+    if (!code) return showToast("동기화 코드를 입력하거나 새로 만드세요");
+    update((s) => ({ ...s, farms: s.farms.map((f) => (f.id === farm.id ? { ...f, syncCode: code } : f)) }));
+    showToast("자동 동기화가 켜졌습니다");
+  };
+  const stopSync = () => {
+    sync.stop();
+    update((s) => ({ ...s, farms: s.farms.map((f) => (f.id === farm.id ? { ...f, syncCode: null } : f)) }));
+    showToast("자동 동기화를 껐습니다");
+  };
+
+  return (
+    <div>
+      <ScreenHeader title="설정" sub={`${user.name} · ${farm.name}`} />
+      <div style={{ padding: "0 14px" }}>
+        <Card style={{ marginBottom: 12 }}>
+          <SectionTitle>농장 위치 · 실시간 날씨</SectionTitle>
+          <div style={{ fontSize: 13, color: farm.lat != null ? T.ok : T.faint, marginBottom: 4, fontWeight: 600 }}>
+            {farm.lat != null
+              ? `✓ 등록됨: ${farm.region || "좌표"}`
+              : "아직 위치가 없어 추정 날씨를 사용 중입니다"}
+          </div>
+          {farm.lat != null && (
+            <div style={{ fontSize: 12.5, color: T.sub, marginBottom: 12, lineHeight: 1.6 }}>
+              좌표 {farm.lat.toFixed(5)}, {farm.lng.toFixed(5)}
+              {farm.gpsAccuracy != null && (
+                <span style={{ color: farm.gpsAccuracy <= 20 ? T.ok : farm.gpsAccuracy <= 100 ? T.watch : T.caution, fontWeight: 700 }}>
+                  {" "}· GPS 정확도 ±{farm.gpsAccuracy}m
+                </span>
+              )}
+              {farm.gpsAccuracy == null && <span style={{ color: T.faint }}> · 시·군 대표 좌표</span>}
+              <br />
+              <a href={`https://maps.google.com/?q=${farm.lat},${farm.lng}`} target="_blank" rel="noreferrer"
+                style={{ color: T.accent, textDecoration: "none", fontWeight: 700 }}>
+                지도에서 이 위치 확인 →
+              </a>
+            </div>
+          )}
+
+          {/* 1순위: GPS — 농장에서 버튼 한 번이면 리 단위보다 정밀 */}
+          <Btn kind="primary" onClick={useGPS} disabled={geoBusy} style={{ width: "100%" }}>
+            {geoBusy ? "위치 확인 중…" : farm.gpsAccuracy != null ? "📍 위치 다시 잡기 (더 정밀하게)" : "📍 지금 농장에서 현재 위치로 등록"}
+          </Btn>
+          {gpsStatus ? (
+            <div style={{ fontSize: 13, color: gpsStatus.startsWith("✓") ? T.ok : T.sub, marginTop: 8, lineHeight: 1.5, fontWeight: 600 }}>
+              {gpsStatus}
+            </div>
+          ) : (
+            <div style={{ fontSize: 12.5, color: T.faint, marginTop: 6, lineHeight: 1.5 }}>
+              농장이나 하우스에서 누르면 읍·면·리 단위보다 정밀하게(수 미터 오차) 잡힙니다. 하늘이 트인 야외에서 가장 정확합니다.
+            </div>
+          )}
+
+          <div style={{ display: "flex", alignItems: "center", gap: 10, margin: "14px 0 12px" }}>
+            <div style={{ flex: 1, height: 1, background: T.line }} />
+            <span style={{ fontSize: 12.5, color: T.faint }}>GPS가 안 될 때 — 지역 선택</span>
+            <div style={{ flex: 1, height: 1, background: T.line }} />
+          </div>
+
+          {/* 2순위: 시·도 → 시·군 (내장 데이터, 인터넷 검색 불필요) */}
+          {!sido ? (
+            <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
+              {Object.keys(KR_REGIONS).map((s) => (
+                <Chip key={s} color={T.accent} onClick={() => setSido(s)}>{s}</Chip>
+              ))}
+            </div>
+          ) : (
+            <div>
+              <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 8 }}>
+                <button onClick={() => setSido("")} style={{ background: T.panel2, border: `1px solid ${T.line}`, borderRadius: 8, padding: "4px 10px", color: T.ink, cursor: "pointer", fontWeight: 700, fontSize: 12 }}>← 시·도</button>
+                <span style={{ fontWeight: 800 }}>{sido}</span>
+                <span style={{ color: T.faint, fontSize: 12 }}>· 시·군·구를 누르세요</span>
+              </div>
+              <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
+                {KR_REGIONS[sido].map((g, i) => (
+                  <Chip key={i} color={T.ok} onClick={() => pickGugun(sido, g)}>{g[0]}</Chip>
+                ))}
+              </div>
+            </div>
+          )}
+
+          <div style={{ fontSize: 12.5, color: T.faint, marginTop: 12, lineHeight: 1.5 }}>
+            날씨 데이터는 수 km 격자 기준이라, 같은 면 안에서는 어디든 거의 같은 값입니다. 그래서 리 이름을 고르는 것보다 GPS 등록이 더 정확합니다.
+          </div>
+        </Card>
+
+        <Card style={{ marginBottom: 12 }}>
+          <SectionTitle>아침 알림 시간</SectionTitle>
+          <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+            {[["05:00", "5시"], ["06:00", "6시"], ["07:00", "7시"], ["off", "끄기"]].map(([v, l]) => (
+              <Chip key={v} active={(state.settings.morningEnabled ? state.settings.morningTime : "off") === v} color={T.accent} onClick={() => setMorning(v)}>{l}</Chip>
+            ))}
+          </div>
+          <div style={{ fontSize: 12.5, color: T.faint, marginTop: 10, lineHeight: 1.6 }}>
+            매일 이 시각에 ‘오늘 할 일 요약’이 상단 배너로 표시됩니다. 실제 기기 푸시 알림은 네이티브 앱/PWA 배포 시 연결됩니다.
+          </div>
+        </Card>
+
+        <Card style={{ marginBottom: 12 }}>
+          <SectionTitle>하우스 관리 ({houses.length}동)</SectionTitle>
+          <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginBottom: 12 }}>
+            {houses.map((h) => (
+              <div key={h.id} style={{ background: T.panel2, border: `1px solid ${T.line}`, borderRadius: 8, padding: "6px 10px", fontSize: 13 }}>
+                {h.name} <span style={{ color: T.faint }}>{h.flower || "미등록"}</span>
+              </div>
+            ))}
+          </div>
+          <div style={{ display: "flex", gap: 8 }}>
+            <input style={inputStyle} type="number" value={addCount} onChange={(e) => setAddCount(e.target.value)} placeholder="추가할 동 수" />
+            <Btn kind="primary" onClick={addHouses} style={{ flexShrink: 0 }}>추가</Btn>
+          </div>
+        </Card>
+
+        <Card style={{ marginBottom: 12 }}>
+          <SectionTitle>데이터</SectionTitle>
+          <div style={{ fontSize: 13, color: T.sub, lineHeight: 1.7 }}>
+            작업 {state.workLogs.length}건 · 수확 {state.harvestLogs.length}건 · 출하 {state.shipments.length}건<br />
+            모든 입력은 버튼을 누르는 즉시, 그리고 입력 중에도 자동 저장됩니다. 앱이 꺼져도 다시 열면 이어집니다.
+          </div>
+        </Card>
+
+        {/* 자동 동기화 (Firebase) */}
+        <Card style={{ marginBottom: 12 }}>
+          <SectionTitle>자동 동기화 (두 폰 함께 쓰기)</SectionTitle>
+          {!syncConfigured ? (
+            <div style={{ fontSize: 13, color: T.faint, lineHeight: 1.6 }}>
+              자동 동기화는 Firebase 설정이 필요합니다. 함께 드린 <b style={{ color: T.sub }}>설정 안내</b>대로 키를 한 번 넣으면, 두 분이 같은 농장 코드로 로그인했을 때 한쪽 입력이 자동으로 다른 쪽에 나타납니다. (지금은 미설정 상태 — 로컬 저장만 동작)
+            </div>
+          ) : farm.syncCode ? (
+            <div>
+              <div style={{ fontSize: 13, color: T.ok, fontWeight: 700, marginBottom: 6 }}>
+                ✓ 자동 동기화 켜짐
+              </div>
+              <div style={{ fontSize: 13, color: T.sub, marginBottom: 10, lineHeight: 1.6 }}>
+                농장 코드: <b style={{ color: T.accent, fontSize: 14 }}>{farm.syncCode}</b><br />
+                상대도 같은 코드를 입력하면 자동으로 같은 데이터를 보게 됩니다. 입력하면 몇 초 안에 서로 반영됩니다.
+              </div>
+              <Btn kind="danger" onClick={stopSync} style={{ width: "100%" }}>자동 동기화 끄기</Btn>
+            </div>
+          ) : (
+            <div>
+              <div style={{ fontSize: 13, color: T.sub, lineHeight: 1.6, marginBottom: 10 }}>
+                한 분이 코드를 만들어 켜고, 그 코드를 상대에게 알려주세요. 상대가 자기 폰 설정에서 같은 코드를 입력하면 둘이 자동으로 연결됩니다.
+              </div>
+              <div style={{ display: "flex", gap: 8, marginBottom: 8 }}>
+                <input style={inputStyle} value={syncInput} onChange={(e) => setSyncInput(e.target.value)} placeholder="농장 코드 (예: FARM-AB3K9)" />
+                <Btn kind="ghost" onClick={genCode} style={{ flexShrink: 0 }}>새로 만들기</Btn>
+              </div>
+              <Btn kind="primary" onClick={saveSyncCode} style={{ width: "100%" }}>이 코드로 자동 동기화 켜기</Btn>
+            </div>
+          )}
+        </Card>
+
+        {/* 2인 공유 (수동, 백업용) */}
+        <Card style={{ marginBottom: 12 }}>
+          <SectionTitle>수동 공유 (인터넷·설정 없이 백업용)</SectionTitle>
+          <div style={{ fontSize: 13, color: T.sub, lineHeight: 1.6, marginBottom: 12 }}>
+            자동 동기화를 안 쓰거나 막힐 때, 코드를 카톡으로 주고받아 합칠 수 있습니다. <b style={{ color: T.watch }}>처음 한 번</b>은 한 사람이 만든 농장을 상대가 "가져와서 합치기"로 받아 같은 농장으로 시작하세요.
+          </div>
+
+          <div style={{ display: "flex", gap: 8, marginBottom: shareMode ? 12 : 0 }}>
+            <Btn kind="primary" onClick={doExport} style={{ flex: 1 }}>① 공유 코드 내보내기</Btn>
+            <Btn kind="ghost" onClick={() => { setShareMode("in"); setShareCode(""); }} style={{ flex: 1 }}>② 가져와서 합치기</Btn>
+          </div>
+
+          {shareMode === "out" && (
+            <div>
+              <div style={{ fontSize: 13, color: T.ok, marginBottom: 6, fontWeight: 600 }}>아래 코드를 복사해 카톡으로 상대에게 보내세요</div>
+              <textarea readOnly value={shareCode} onFocus={(e) => e.target.select()}
+                style={{ ...inputStyle, minHeight: 80, fontSize: 12.5, fontFamily: "monospace", resize: "vertical" }} />
+              <div style={{ display: "flex", gap: 8, marginTop: 8 }}>
+                <Btn kind="primary" onClick={copyCode} style={{ flex: 1 }}>코드 복사</Btn>
+                <Btn kind="plain" onClick={() => setShareMode(null)} style={{ flex: 1 }}>닫기</Btn>
+              </div>
+            </div>
+          )}
+
+          {shareMode === "in" && (
+            <div>
+              <div style={{ fontSize: 13, color: T.sub, marginBottom: 6 }}>상대가 보낸 코드를 붙여넣고 합치기를 누르세요</div>
+              <textarea value={importText} onChange={(e) => setImportText(e.target.value)} placeholder="여기에 코드 붙여넣기"
+                style={{ ...inputStyle, minHeight: 80, fontSize: 12.5, fontFamily: "monospace", resize: "vertical" }} />
+              <div style={{ display: "flex", gap: 8, marginTop: 8 }}>
+                <Btn kind="primary" onClick={doImport} style={{ flex: 1 }}>합치기</Btn>
+                <Btn kind="plain" onClick={() => { setShareMode(null); setImportText(""); }} style={{ flex: 1 }}>닫기</Btn>
+              </div>
+            </div>
+          )}
+
+          <div style={{ fontSize: 12.5, color: T.faint, marginTop: 12, lineHeight: 1.5 }}>
+            합치기는 덮어쓰기가 아니라 두 기록을 시간순으로 합칩니다. 같은 하우스의 개폐기·차광망 현재 상태처럼 하나뿐인 값은 더 최근에 누른 쪽을 따릅니다. (실시간 자동은 아니며, 합치기 버튼을 눌러야 동기화됩니다.)
+          </div>
+        </Card>
+
+        {/* 꽃 정보 추가 */}
+        <Card style={{ marginBottom: 12 }}>
+          <SectionTitle>꽃 정보 추가</SectionTitle>
+          <div style={{ fontSize: 13, color: T.faint, lineHeight: 1.6, marginBottom: 12 }}>
+            기본 제공 꽃에 없는 품종을 GPT·제미나이로 만들어 이 계정에 추가할 수 있습니다.
+          </div>
+          <FlowerAddPanel user={user} state={state} update={update} showToast={showToast} />
+        </Card>
+
+        <Btn kind="danger" onClick={logout} style={{ width: "100%" }}>로그아웃</Btn>
+      </div>
+      <Note />
+      <div style={{ height: 20 }} />
+    </div>
+  );
+}
