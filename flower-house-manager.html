@@ -812,6 +812,16 @@ const PEST_LIFECYCLE = {
 };
 const DEFAULT_LIFECYCLE = { stages: [{ key: "egg", label: "알", days: 5 }, { key: "larva", label: "유충", days: 10 }, { key: "pupa", label: "번데기", days: 7 }, { key: "adult", label: "성충", days: 12 }], note: "일반적인 곤충 생애주기 추정값입니다. 실제 발생은 종·온도에 따라 달라집니다." };
 
+/* 꽃·잎에 실제 피해를 주는 단계(가해 충태). 잎굴파리·나방류·뿌리해충은 유충, 그 외(총채벌레·응애·진딧물·가루이)는 성충/약충 흡즙이 주가해 → adult 기준 */
+const PEST_DAMAGE_STAGE = {
+  "굴파리": "larva", "나방": "larva", "작은뿌리파리": "larva", "뿌리혹선충": "larva",
+};
+function pestDamageStage(name) {
+  const n = String(name || "");
+  const k = Object.keys(PEST_DAMAGE_STAGE).sort((a, b) => b.length - a.length).find((key) => n.includes(key));
+  return k ? PEST_DAMAGE_STAGE[k] : "adult";
+}
+
 function pestLifecycle(name) {
   const n = String(name || "");
   const keys = Object.keys(PEST_LIFECYCLE).sort((a, b) => b.length - a.length);
@@ -827,17 +837,11 @@ function normalizeLifecycle(obj) {
   return { stages: [{ key: "egg", label: "알", days: e }, { key: "larva", label: "유충", days: l }, { key: "pupa", label: "번데기", days: p }, { key: "adult", label: "성충", days: a }], note: "사용자가 추가한 꽃의 생애주기 정보입니다." };
 }
 
-/* 정식일 + 미리 저장된 생애주기 → 오늘 충태 + 과거/미래 흐름 + 성충 전환 예상일.
-   사람이 벌레를 본 날이 아니라, 심은 날짜를 기준으로 연속 세대를 추정한다. */
-function computePestForecast(house, profInfo) {
-  const planting = plantingRoundsFor(house)[0]?.date;
+/* 해충 1종의 오늘 충태 계산 (코어). 정식일 기준 연속 세대 추정.
+   danger(0~1): 꽃·잎에 위협적인 정도 — 가해 단계 진행 중이거나 가해 단계로 곧 바뀌면 높음. */
+function computePestStage(pestName, planting, customLcObj) {
   if (!planting) return null;
-  const prevention = getFlowerPrevention(profInfo.key) || {};
-  const pests = (prevention.pests || []).filter(Boolean);
-  if (!pests.length) return null;
-  const pestName = pests[0];
-  const customLc = normalizeLifecycle(_activeCustomFlowers[profInfo.key]?.prevention?.pestLifecycles?.[pestName]);
-  const lc = customLc || pestLifecycle(pestName);
+  const lc = normalizeLifecycle(customLcObj) || pestLifecycle(pestName);
   const stages = lc.stages;
   const total = stages.reduce((acc, s) => acc + s.days, 0);
   if (total <= 0) return null;
@@ -849,7 +853,12 @@ function computePestForecast(house, profInfo) {
   let acc = 0;
   const stageInfos = stages.map((s) => { const startOff = acc; acc += s.days; return { ...s, startOff, endOff: acc }; });
   const pos = daysSince - cycleBase;
-  const current = stageInfos.find((s) => pos >= s.startOff && pos < s.endOff) || stageInfos[stageInfos.length - 1];
+  let curIdx = stageInfos.findIndex((s) => pos >= s.startOff && pos < s.endOff);
+  if (curIdx < 0) curIdx = stageInfos.length - 1;
+  const current = stageInfos[curIdx];
+  const stageStart = addDaysISO(planting, cycleBase + current.startOff);
+  const stageEnd = addDaysISO(planting, cycleBase + current.endOff);
+  const daysLeftInStage = Math.max(0, dayDiff(today, stageEnd));
   const stageDates = stageInfos.map((s) => {
     const off = cycleBase + s.startOff;
     return { key: s.key, label: s.label, date: addDaysISO(planting, off), past: off <= daysSince };
@@ -859,11 +868,42 @@ function computePestForecast(house, profInfo) {
   if (dayDiff(today, adultDate) < 0) adultDate = addDaysISO(planting, cycleBase + total + adultInfo.startOff);
   const daysToAdult = dayDiff(today, adultDate);
   const isAdultNow = current.key === "adult";
+  // --- 위급도(danger) ---
+  const damageKey = lc.damage || pestDamageStage(pestName);
+  const span = current.endOff - current.startOff;
+  const frac = span > 0 ? (pos - current.startOff) / span : 0; // 현재 단계 진행률
+  const nextKey = curIdx + 1 < stageInfos.length ? stageInfos[curIdx + 1].key : stageInfos[0].key;
+  let danger = 0;
+  if (current.key === damageKey) danger += 0.6;          // 지금 가해 단계 (잎/꽃 피해 중)
+  if (nextKey === damageKey && frac >= 0.5) danger += 0.35; // 곧 가해 단계로 전환 (부화·우화 임박)
+  if (frac >= 0.6) danger += 0.18;                        // 다음 단계로 전환 임박
+  if (isAdultNow && damageKey === "adult") danger += 0.12; // 성충이 꽃 가해
+  danger = Math.max(0, Math.min(1, danger));
   let actionLevel, action;
   if (isAdultNow || (daysToAdult >= 0 && daysToAdult <= 3)) { actionLevel = "urgent"; action = "예찰·예방 방제 준비"; }
   else if (daysToAdult <= 7) { actionLevel = "soon"; action = "성충 전환 임박 · 예찰 준비"; }
   else { actionLevel = "info"; action = "관찰 유지"; }
-  return { pest: pestName, allPests: pests, stageLabel: current.label, stageKey: current.key, stageDates, adultDate, daysToAdult, isAdultNow, actionLevel, action, note: lc.note };
+  return { pest: pestName, stageLabel: current.label, stageKey: current.key, stageStart, stageEnd, daysLeftInStage, stageDates, adultDate, daysToAdult, isAdultNow, damageKey, danger, actionLevel, action, note: lc.note };
+}
+
+/* 정식일 + 저장된 생애주기 → 대표 해충(첫 번째)의 오늘 충태 + 과거/미래 흐름. */
+function computePestForecast(house, profInfo) {
+  const planting = plantingRoundsFor(house)[0]?.date;
+  if (!planting) return null;
+  const pests = (getFlowerPrevention(profInfo.key)?.pests || []).filter(Boolean);
+  if (!pests.length) return null;
+  const customLcs = _activeCustomFlowers[profInfo.key]?.prevention?.pestLifecycles || {};
+  const f = computePestStage(pests[0], planting, customLcs[pests[0]]);
+  return f ? { ...f, allPests: pests } : null;
+}
+
+/* 꽃의 모든 취약 해충 충태를 계산해 위급도(danger) 높은 순으로 정렬 (해충 현황 그리드용) */
+function computeAllPestStages(house, profInfo) {
+  const planting = plantingRoundsFor(house)[0]?.date;
+  if (!planting) return [];
+  const pests = (getFlowerPrevention(profInfo.key)?.pests || []).filter(Boolean);
+  const customLcs = _activeCustomFlowers[profInfo.key]?.prevention?.pestLifecycles || {};
+  return pests.map((p) => computePestStage(p, planting, customLcs[p])).filter(Boolean).sort((a, b) => b.danger - a.danger);
 }
 
 /* 정식일 + 마지막 물 준 날 + 꽃별 물 요구도 + 생육단계 + 날씨 → 다음 물주기 예상일 (참고용) */
@@ -1244,6 +1284,43 @@ function BigStat({ label, value, sub, color }) {
       <div style={{ fontSize: 13, color: T.faint, fontWeight: 700, marginBottom: 3 }}>{label}</div>
       <div style={{ fontSize: 22, fontWeight: 900, color: color || T.ink, lineHeight: 1.15, wordBreak: "keep-all" }}>{value}</div>
       {sub && <div style={{ fontSize: 12.5, color: T.sub, marginTop: 2 }}>{sub}</div>}
+    </div>
+  );
+}
+
+/* 해충 충태 정사각형 그리드.
+   한 칸 = 벌레 이름 + 현재 충태 + 그 충태가 언제부터~언제까지.
+   꽃에 위협적인(가해 단계 진행/임박) 벌레일수록 진한 빨강, 약할수록 옅게.
+   열 수는 화면 너비에 따라 자동(3·4칸 이상). */
+function PestGrid({ pests }) {
+  if (!pests || !pests.length) {
+    return <div style={{ fontSize: 13.5, color: T.faint, lineHeight: 1.6 }}>꽃 이름과 정식일을 등록하면 취약 해충의 충태가 표시됩니다.</div>;
+  }
+  return (
+    <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(98px, 1fr))", gap: 8 }}>
+      {pests.map((p, i) => {
+        const d = p.danger || 0;
+        const strong = d >= 0.5;
+        const bg = d < 0.05 ? T.panel2 : `rgba(224,83,60,${(0.14 + d * 0.78).toFixed(3)})`;
+        const border = `rgba(224,83,60,${(0.25 + d * 0.7).toFixed(3)})`;
+        const ink = strong ? "#FFFFFF" : T.ink;
+        const subInk = strong ? "rgba(255,255,255,0.88)" : T.sub;
+        const faintInk = strong ? "rgba(255,255,255,0.78)" : T.faint;
+        return (
+          <div key={p.pest + i} style={{
+            aspectRatio: "1 / 1", background: bg, border: `1.5px solid ${d < 0.05 ? T.line : border}`,
+            borderRadius: 14, padding: 8, display: "flex", flexDirection: "column",
+            alignItems: "center", justifyContent: "center", textAlign: "center", overflow: "hidden",
+          }}>
+            <div style={{ fontSize: 13.5, fontWeight: 900, color: ink, lineHeight: 1.18, wordBreak: "keep-all" }}>{p.pest}</div>
+            <div style={{ fontSize: 15, fontWeight: 900, color: ink, marginTop: 4 }}>{p.stageLabel}</div>
+            <div style={{ fontSize: 11, color: subInk, marginTop: 4, lineHeight: 1.3 }}>{fmtDate(p.stageStart)}~{fmtDate(p.stageEnd)}</div>
+            {p.stageKey === p.damageKey && (
+              <div style={{ fontSize: 10, fontWeight: 800, color: faintInk, marginTop: 3 }}>가해 단계</div>
+            )}
+          </div>
+        );
+      })}
     </div>
   );
 }
@@ -4570,6 +4647,15 @@ function HouseDetail({ state, update, farm, user, houseId, onBack, showToast, we
             </div>
           </Card>
         )}
+
+        {/* 해충 현황 — 정사각형 그리드 (위급할수록 진한 빨강) */}
+        <Card style={{ marginBottom: 10 }}>
+          <SectionTitle>해충 현황</SectionTitle>
+          <PestGrid pests={computeAllPestStages(house, flowerProfile(house.flower))} />
+          <div style={{ marginTop: 10, fontSize: 12, color: T.faint, lineHeight: 1.55 }}>
+            칸마다 벌레 이름·현재 충태·그 충태 기간을 보여줍니다. 꽃·잎에 피해가 큰(가해 단계 진행/임박) 벌레일수록 <span style={{ color: "#E0533C", fontWeight: 800 }}>진한 빨강</span>으로 표시됩니다. 심은 날짜와 저장된 생애주기로 계산한 추정값입니다.
+          </div>
+        </Card>
 
         {/* 해충 생애주기 예측 (충태) */}
         <Card style={{ marginBottom: 10 }}>
