@@ -853,6 +853,66 @@ function computeAllPestStages(house, profInfo) {
   return pests.map((p) => computePestStage(p, planting, customLcs[p])).filter(Boolean).sort((a, b) => b.danger - a.danger);
 }
 
+/* ============================ 병(질병) 발병 주기/위험 ===========================
+   병은 곤충처럼 알·유충 단계가 없고 날씨(습도·온도·강수)와 생육단계에서 발병이 늘어난다.
+   각 병의 호발 조건과 호발 시기(peak)를 내장해, 현재 날씨 기준 발병 위험(danger 0~1)을 추정한다. */
+const DISEASE_RISK = {
+  "잿빛곰팡이": { hum: 1.0, temp: [12, 23], rain: 0.6, peak: "개화·절화기", note: "저온다습·환기부족" },
+  "노균병": { hum: 1.0, temp: [10, 22], rain: 0.7, peak: "생육기", note: "잎 결로·과습" },
+  "흰녹병": { hum: 0.85, temp: [15, 24], rain: 0.5, peak: "생육기", note: "다습·결로" },
+  "흰가루병": { hum: 0.55, temp: [16, 27], rain: 0.0, peak: "생육기", note: "밤낮 습도차" },
+  "균핵병": { hum: 0.9, temp: [12, 22], rain: 0.5, peak: "생육기", note: "저온다습·밀식" },
+  "탄저병": { hum: 0.9, temp: [20, 28], rain: 0.7, peak: "고온다습기", note: "강우·물 튐" },
+  "역병": { hum: 1.0, temp: [18, 26], rain: 0.8, peak: "장마철", note: "과습·배수불량" },
+  "녹병": { hum: 0.8, temp: [15, 24], rain: 0.5, peak: "생육기", note: "다습·결로" },
+  "검은무늬": { hum: 0.85, temp: [18, 27], rain: 0.6, peak: "생육기", note: "다습·강우" },
+  "점무늬": { hum: 0.8, temp: [18, 27], rain: 0.6, peak: "생육기", note: "강우·물 튐" },
+  "반점": { hum: 0.8, temp: [18, 27], rain: 0.6, peak: "생육기", note: "강우·물 튐" },
+  "잎마름": { hum: 0.8, temp: [18, 28], rain: 0.5, peak: "생육기", note: "다습·상처" },
+  "잎썩음": { hum: 0.85, temp: [18, 28], rain: 0.5, peak: "생육기", note: "과습·통풍불량" },
+  "시들음": { hum: 0.4, temp: [24, 32], rain: 0.2, peak: "고온기·정식후", note: "고온·연작토양" },
+  "줄기썩음": { hum: 0.8, temp: [18, 28], rain: 0.6, peak: "전 기간", note: "과습·배수불량" },
+  "목썩음": { hum: 0.8, temp: [18, 28], rain: 0.6, peak: "전 기간", note: "과습·배수불량" },
+  "뿌리썩음": { hum: 0.75, temp: [18, 28], rain: 0.6, peak: "전 기간", note: "과습·배수불량" },
+  "마른썩음": { hum: 0.6, temp: [18, 28], rain: 0.3, peak: "저장·정식기", note: "상처·연작" },
+  "구근부패": { hum: 0.6, temp: [15, 25], rain: 0.4, peak: "정식·저장기", note: "과습·상처" },
+  "구근부패병": { hum: 0.6, temp: [15, 25], rain: 0.4, peak: "정식·저장기", note: "과습·상처" },
+  "입고": { hum: 0.8, temp: [18, 26], rain: 0.5, peak: "활착기", note: "과습·유묘기" },
+  "혹병": { hum: 0.5, temp: [18, 26], rain: 0.3, peak: "전 기간", note: "상처 통한 세균 감염" },
+  "모자이크": { hum: 0.0, temp: [10, 30], rain: 0.0, peak: "전 기간", note: "매개충(진딧물·총채벌레)", vector: true },
+  "위조바이러스": { hum: 0.0, temp: [10, 30], rain: 0.0, peak: "전 기간", note: "매개충(총채벌레)", vector: true },
+  "바이러스": { hum: 0.0, temp: [10, 30], rain: 0.0, peak: "전 기간", note: "매개충 관리", vector: true },
+};
+const DEFAULT_DISEASE = { hum: 0.7, temp: [16, 26], rain: 0.4, peak: "생육기", note: "다습·통풍불량 주의" };
+function diseaseRiskProfile(name) {
+  const n = String(name || "");
+  const k = Object.keys(DISEASE_RISK).sort((a, b) => b.length - a.length).find((key) => n.includes(key));
+  return k ? DISEASE_RISK[k] : DEFAULT_DISEASE;
+}
+function computeDiseaseRisks(house, profInfo, weather) {
+  const diseases = (getFlowerPrevention(profInfo.key)?.diseases || []).filter(Boolean);
+  if (!diseases.length) return [];
+  const w = weather || {};
+  const hum = Number(w.humidity) || 0, temp = Number(w.cur) || 20, rainProb = Number(w.rainProb) || 0, fog = !!w.fog;
+  return diseases.map((d) => {
+    const r = diseaseRiskProfile(d);
+    let danger;
+    if (r.vector) {
+      danger = 0.4;
+    } else {
+      danger = 0.12;
+      if (hum >= 85) danger += 0.4 * r.hum; else if (hum >= 75) danger += 0.26 * r.hum; else if (hum >= 65) danger += 0.13 * r.hum;
+      if (fog) danger += 0.12 * r.hum;
+      if (rainProb >= 60) danger += 0.22 * Math.max(0, r.rain); else if (rainProb >= 40) danger += 0.12 * Math.max(0, r.rain);
+      if (temp >= r.temp[0] && temp <= r.temp[1]) danger += 0.2;
+    }
+    danger = Math.max(0, Math.min(1, danger));
+    const riskLabel = danger >= 0.6 ? "위험 높음" : danger >= 0.35 ? "보통" : "낮음";
+    const name = d.replace(/\(.*?\)/g, "").trim();
+    return { disease: name, danger, riskLabel, peak: r.peak, note: r.note, vector: !!r.vector };
+  }).sort((a, b) => b.danger - a.danger);
+}
+
 function computeWatering(house, profInfo, ctx) {
   const { workLogs, weather } = ctx;
   const logsFor = workLogs.filter((w) => w.houseId === house.id);
@@ -1258,12 +1318,45 @@ function PestGrid({ pests }) {
             borderRadius: 14, padding: 8, display: "flex", flexDirection: "column",
             alignItems: "center", justifyContent: "center", textAlign: "center", overflow: "hidden",
           }}>
-            <div style={{ fontSize: 13.5, fontWeight: 900, color: ink, lineHeight: 1.18, wordBreak: "keep-all" }}>{p.pest}</div>
+            <div style={{ fontSize: p.pest.length >= 8 ? 11 : p.pest.length >= 6 ? 12.5 : 13.5, fontWeight: 900, color: ink, lineHeight: 1.15, wordBreak: "break-all" }}>{p.pest}</div>
             <div style={{ fontSize: 15, fontWeight: 900, color: ink, marginTop: 4 }}>{p.stageLabel}</div>
             <div style={{ fontSize: 11, color: subInk, marginTop: 4, lineHeight: 1.3 }}>{fmtDate(p.stageStart)}~{fmtDate(p.stageEnd)}</div>
             {p.stageKey === p.damageKey && (
               <div style={{ fontSize: 10, fontWeight: 800, color: faintInk, marginTop: 3 }}>가해 단계</div>
             )}
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+/* 병(질병) 발병 위험 정사각형 그리드.
+   한 칸 = 병 이름 + 현재 발병 위험 + 호발 시기(주기). 현재 날씨 기준 위험이 클수록 진한 빨강. */
+function DiseaseGrid({ diseases }) {
+  if (!diseases || !diseases.length) {
+    return <div style={{ fontSize: 13.5, color: T.faint, lineHeight: 1.6 }}>이 꽃에 등록된 주요 병 자료가 없습니다.</div>;
+  }
+  return (
+    <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(98px, 1fr))", gap: 8 }}>
+      {diseases.map((p, i) => {
+        const d = p.danger || 0;
+        const strong = d >= 0.5;
+        const bg = d < 0.05 ? T.panel2 : `rgba(224,83,60,${(0.14 + d * 0.78).toFixed(3)})`;
+        const border = `rgba(224,83,60,${(0.25 + d * 0.7).toFixed(3)})`;
+        const ink = strong ? "#FFFFFF" : T.ink;
+        const subInk = strong ? "rgba(255,255,255,0.88)" : T.sub;
+        const faintInk = strong ? "rgba(255,255,255,0.78)" : T.faint;
+        return (
+          <div key={p.disease + i} style={{
+            aspectRatio: "1 / 1", background: bg, border: `1.5px solid ${d < 0.05 ? T.line : border}`,
+            borderRadius: 14, padding: 8, display: "flex", flexDirection: "column",
+            alignItems: "center", justifyContent: "center", textAlign: "center", overflow: "hidden",
+          }}>
+            <div style={{ fontSize: p.disease.length >= 9 ? 10.5 : p.disease.length >= 6 ? 12 : 13, fontWeight: 900, color: ink, lineHeight: 1.15, wordBreak: "break-all" }}>{p.disease}</div>
+            <div style={{ fontSize: 14, fontWeight: 900, color: ink, marginTop: 4 }}>{p.riskLabel}</div>
+            <div style={{ fontSize: 11, color: subInk, marginTop: 4, lineHeight: 1.3 }}>{p.peak}</div>
+            {p.vector && <div style={{ fontSize: 10, fontWeight: 800, color: faintInk, marginTop: 3 }}>매개충 주의</div>}
           </div>
         );
       })}
@@ -3017,6 +3110,31 @@ function housePreventionSchedule(house, bloomEstimates = [], weather = {}) {
     });
   });
 }
+/* 절화 전 예방 — 요약판 (60대 사용성: 현재 단계 + 집중 예찰 + 다음 단계만 짧게) */
+function PreventionSummary({ house, estimates, weather }) {
+  const schedule = housePreventionSchedule(house, estimates, weather);
+  if (!schedule.length) return <Empty text="정식일을 입력하면 절화 전 예방 일정이 표시됩니다" />;
+  const today = todayISO();
+  const bucket = (it) => (today >= it.start && today <= it.end) ? 0 : (it.start > today ? 1 : 2);
+  const ordered = [...schedule].sort((a, b) => bucket(a) - bucket(b) || a.start.localeCompare(b.start));
+  const cur = ordered.find((it) => bucket(it) === 0) || ordered.find((it) => bucket(it) === 1) || ordered[0];
+  const next = schedule.filter((it) => it.start > today).sort((a, b) => a.start.localeCompare(b.start))[0];
+  const isNow = today >= cur.start && today <= cur.end;
+  return (
+    <div>
+      <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 8, flexWrap: "wrap" }}>
+        <TaskTag level={isNow ? "today" : "soon"}>{cur.title}</TaskTag>
+        <span style={{ fontSize: 13, color: T.sub }}>{fmtDate(cur.start)}~{fmtDate(cur.end)}{isNow ? " · 지금" : ""}</span>
+      </div>
+      <div style={{ fontSize: 16, fontWeight: 800, marginBottom: 6, lineHeight: 1.3 }}>집중 예찰 <span style={{ color: T.accent }}>{cur.focus}</span></div>
+      <div style={{ fontSize: 14, color: T.sub, lineHeight: 1.55, marginBottom: 8 }}>{cur.action}</div>
+      {cur.weatherNote && <div style={{ marginBottom: 8 }}><TaskTag level="urgent">{cur.weatherNote}</TaskTag></div>}
+      {next && <div style={{ fontSize: 13.5, color: T.faint }}>다음: {next.title} · {fmtDate(next.start)}부터</div>}
+      <div style={{ fontSize: 11.5, color: T.faint, marginTop: 10, lineHeight: 1.5 }}>※ 농약 의무 살포일이 아니라 집중 예찰·판단 기간입니다. 살포는 발생 확인과 등록작물·제품 라벨 안전사용기준을 확인한 뒤 기록하세요.</div>
+    </div>
+  );
+}
+
 function PreventionChecklist({ house, estimates, weather, update, showToast }) {
   const schedule = housePreventionSchedule(house, estimates, weather);
   const records = house.preventionRecords || {};
@@ -4596,6 +4714,15 @@ function HouseDetail({ state, update, farm, user, houseId, onBack, showToast, we
           </div>
         </Card>
 
+        {/* 병(질병) 현황 — 정사각형 그리드 (현재 날씨 기준 발병 위험) */}
+        <Card style={{ marginBottom: 10 }}>
+          <SectionTitle>병(질병) 현황</SectionTitle>
+          <DiseaseGrid diseases={computeDiseaseRisks(house, flowerProfile(house.flower), weather)} />
+          <div style={{ marginTop: 10, fontSize: 12, color: T.faint, lineHeight: 1.55 }}>
+            칸마다 병 이름·현재 발병 위험·호발 시기(주기)를 보여줍니다. 현재 날씨(습도·온도·강수) 기준 위험이 클수록 <span style={{ color: "#E0533C", fontWeight: 800 }}>진한 빨강</span>으로 표시됩니다. 추정값이며 실제 발병은 하우스 환경에 따라 다릅니다.
+          </div>
+        </Card>
+
         {/* 해충 생애주기 예측 (충태) */}
         <Card style={{ marginBottom: 10 }}>
           <SectionTitle>해충 생애주기 예측</SectionTitle>
@@ -4793,13 +4920,11 @@ function HouseDetail({ state, update, farm, user, houseId, onBack, showToast, we
         })()}
 
         <Card style={{ marginBottom: 10 }}>
-          <SectionTitle>절화 전 예방 체크리스트</SectionTitle>
-          <PreventionChecklist
+          <SectionTitle>절화 전 예방</SectionTitle>
+          <PreventionSummary
             house={house}
             estimates={e.bloomEstimates || []}
             weather={weather || {}}
-            update={update}
-            showToast={showToast}
           />
         </Card>
 
