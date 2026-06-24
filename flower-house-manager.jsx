@@ -727,40 +727,42 @@ async function fetchFlowerImage(name, excluded = []) {
   return null;
 }
 
-/* ============================ 해충 생애주기 (충태 예측) ===========================
-   앱 내부에 미리 저장된 해충별 알·유충·번데기·성충 단계 일수(25℃ 전후 기준 추정).
-   각 단계 배열의 마지막 항목이 '성충'. 실측이 아닌 예방 예측용 추정값이며
-   고온기에는 더 빨라질 수 있다(화면에 항상 '추정' 안내). 정확한 방제는 PSIS 라벨 확인. */
+/* ============================ 해충 생애주기 (충태 예측) — 국내(대한민국) 발생자료 기준 =========
+   발육기간(알·유충/약충·번데기·성충)은 농촌진흥청 농사로(nongsaro.go.kr)와
+   국가농작물병해충관리시스템(NCPMS, ncpms.rda.go.kr)에 수록된 국내 발육 자료(대개 25℃ 전후)를 기준으로 한다.
+   국내 종별 단계 일수가 공개되지 않은 경우 같은 분류군의 국내 자료를 적용하고 src에 '기준'으로 표기한다(추정).
+   해외 발생자료는 사용하지 않는다. 실측이 아닌 예방 예측이며 정확한 방제는 PSIS 라벨에서 등록작물·안전사용기준을 확인한다.
+   src = 근거 출처(국내). */
 const PEST_LIFECYCLE = {
-  "아메리카잎굴파리": { stages: [{ key: "egg", label: "알", days: 3 }, { key: "larva", label: "유충", days: 5 }, { key: "pupa", label: "번데기", days: 9 }, { key: "adult", label: "성충", days: 12 }], note: "성충이 잎에 산란하면 유충이 잎 속을 굴처럼 파고듭니다. 성충 발생 전후에 산란·확산이 늘어 예찰·예방이 중요합니다." },
-  "굴파리": { stages: [{ key: "egg", label: "알", days: 3 }, { key: "larva", label: "유충", days: 5 }, { key: "pupa", label: "번데기", days: 9 }, { key: "adult", label: "성충", days: 12 }], note: "유충이 잎 속을 가해합니다. 성충 발생기 전후 예찰이 중요합니다." },
-  "꽃노랑총채벌레": { stages: [{ key: "egg", label: "알", days: 4 }, { key: "larva", label: "약충", days: 7 }, { key: "pupa", label: "번데기", days: 4 }, { key: "adult", label: "성충", days: 15 }], note: "고온·건조할수록 세대가 빨라집니다. 꽃·생장점 끈끈이트랩과 꽃 털기로 예찰하세요." },
-  "총채벌레": { stages: [{ key: "egg", label: "알", days: 4 }, { key: "larva", label: "약충", days: 7 }, { key: "pupa", label: "번데기", days: 4 }, { key: "adult", label: "성충", days: 15 }], note: "고온·건조할수록 세대가 빨라집니다. 꽃 속과 어린잎을 확대 관찰하세요." },
-  "파총채벌레": { stages: [{ key: "egg", label: "알", days: 4 }, { key: "larva", label: "약충", days: 7 }, { key: "pupa", label: "번데기", days: 4 }, { key: "adult", label: "성충", days: 15 }], note: "고온·건조할수록 세대가 빨라집니다." },
-  "대만총채벌레": { stages: [{ key: "egg", label: "알", days: 4 }, { key: "larva", label: "약충", days: 7 }, { key: "pupa", label: "번데기", days: 4 }, { key: "adult", label: "성충", days: 15 }], note: "고온·건조할수록 세대가 빨라집니다." },
-  "점박이응애": { stages: [{ key: "egg", label: "알", days: 3 }, { key: "larva", label: "유충", days: 2 }, { key: "nymph", label: "약충", days: 4 }, { key: "adult", label: "성충", days: 14 }], note: "고온·건조에서 폭발적으로 증가합니다. 잎 뒷면과 하엽을 확대 관찰하세요." },
-  "차응애": { stages: [{ key: "egg", label: "알", days: 3 }, { key: "larva", label: "유충", days: 2 }, { key: "nymph", label: "약충", days: 4 }, { key: "adult", label: "성충", days: 14 }], note: "고온·건조에서 증가가 빠릅니다. 잎 뒷면을 확대 관찰하세요." },
-  "차먼지응애": { stages: [{ key: "egg", label: "알", days: 3 }, { key: "larva", label: "유충", days: 2 }, { key: "nymph", label: "약충", days: 4 }, { key: "adult", label: "성충", days: 12 }], note: "생장점·어린잎 기형을 유발합니다. 신초를 확대 관찰하세요." },
-  "응애": { stages: [{ key: "egg", label: "알", days: 3 }, { key: "larva", label: "유충", days: 2 }, { key: "nymph", label: "약충", days: 4 }, { key: "adult", label: "성충", days: 14 }], note: "고온·건조에서 증가가 빠릅니다. 잎 뒷면을 확대 관찰하세요." },
-  "뿌리응애": { stages: [{ key: "egg", label: "알", days: 4 }, { key: "larva", label: "유충", days: 4 }, { key: "nymph", label: "약충", days: 5 }, { key: "adult", label: "성충", days: 12 }], note: "구근·뿌리를 가해합니다. 과습·상처를 피하세요." },
-  "목화진딧물": { stages: [{ key: "egg", label: "약충1", days: 2 }, { key: "larva", label: "약충2", days: 3 }, { key: "nymph", label: "약충3", days: 2 }, { key: "adult", label: "성충", days: 10 }], note: "새순·꽃봉오리에 무리 짓고 빠르게 증식합니다. 유시충 유입을 확인하세요." },
-  "복숭아혹진딧물": { stages: [{ key: "egg", label: "약충1", days: 2 }, { key: "larva", label: "약충2", days: 3 }, { key: "nymph", label: "약충3", days: 2 }, { key: "adult", label: "성충", days: 10 }], note: "바이러스 매개가 가능합니다. 새순·잎 뒷면을 확인하세요." },
-  "찔레수염진딧물": { stages: [{ key: "egg", label: "약충1", days: 2 }, { key: "larva", label: "약충2", days: 3 }, { key: "nymph", label: "약충3", days: 2 }, { key: "adult", label: "성충", days: 10 }], note: "새순에 무리 짓습니다." },
-  "국화꼬마수염진딧물": { stages: [{ key: "egg", label: "약충1", days: 2 }, { key: "larva", label: "약충2", days: 3 }, { key: "nymph", label: "약충3", days: 2 }, { key: "adult", label: "성충", days: 10 }], note: "새순·꽃봉오리를 확인하세요." },
-  "진딧물": { stages: [{ key: "egg", label: "약충1", days: 2 }, { key: "larva", label: "약충2", days: 3 }, { key: "nymph", label: "약충3", days: 2 }, { key: "adult", label: "성충", days: 10 }], note: "새순·꽃봉오리에 무리 짓고 빠르게 증식합니다." },
-  "온실가루이": { stages: [{ key: "egg", label: "알", days: 7 }, { key: "larva", label: "약충", days: 8 }, { key: "pupa", label: "번데기", days: 6 }, { key: "adult", label: "성충", days: 12 }], note: "잎 뒷면에 무리 짓습니다. 황색 끈끈이트랩으로 예찰하세요." },
-  "담배가루이": { stages: [{ key: "egg", label: "알", days: 6 }, { key: "larva", label: "약충", days: 8 }, { key: "pupa", label: "번데기", days: 6 }, { key: "adult", label: "성충", days: 12 }], note: "바이러스 매개가 가능합니다. 잎 뒷면·황색 끈끈이트랩을 확인하세요." },
-  "가루이": { stages: [{ key: "egg", label: "알", days: 7 }, { key: "larva", label: "약충", days: 8 }, { key: "pupa", label: "번데기", days: 6 }, { key: "adult", label: "성충", days: 12 }], note: "잎 뒷면 약충과 황색 끈끈이트랩을 확인하세요." },
-  "파밤나방": { stages: [{ key: "egg", label: "알", days: 4 }, { key: "larva", label: "유충", days: 14 }, { key: "pupa", label: "번데기", days: 8 }, { key: "adult", label: "성충(나방)", days: 10 }], note: "어린 유충일 때 방제 효과가 큽니다. 페로몬트랩·식흔을 확인하세요." },
-  "담배거세미나방": { stages: [{ key: "egg", label: "알", days: 4 }, { key: "larva", label: "유충", days: 16 }, { key: "pupa", label: "번데기", days: 9 }, { key: "adult", label: "성충(나방)", days: 10 }], note: "다 자란 유충은 방제가 어렵습니다. 어린 유충기에 대응하세요." },
-  "왕담배나방": { stages: [{ key: "egg", label: "알", days: 4 }, { key: "larva", label: "유충", days: 16 }, { key: "pupa", label: "번데기", days: 10 }, { key: "adult", label: "성충(나방)", days: 10 }], note: "꽃·봉오리 속으로 파고듭니다. 어린 유충기에 대응하세요." },
-  "도둑나방": { stages: [{ key: "egg", label: "알", days: 5 }, { key: "larva", label: "유충", days: 18 }, { key: "pupa", label: "번데기", days: 12 }, { key: "adult", label: "성충(나방)", days: 10 }], note: "야간에 가해합니다. 어린 유충기에 대응하세요." },
-  "미국흰불나방": { stages: [{ key: "egg", label: "알", days: 6 }, { key: "larva", label: "유충", days: 20 }, { key: "pupa", label: "번데기", days: 12 }, { key: "adult", label: "성충(나방)", days: 8 }], note: "군서 유충이 잎을 갉아먹습니다." },
-  "나방류": { stages: [{ key: "egg", label: "알", days: 5 }, { key: "larva", label: "유충", days: 16 }, { key: "pupa", label: "번데기", days: 10 }, { key: "adult", label: "성충(나방)", days: 10 }], note: "어린 유충일 때 방제 효과가 큽니다. 페로몬트랩으로 예찰하세요." },
-  "작은뿌리파리": { stages: [{ key: "egg", label: "알", days: 4 }, { key: "larva", label: "유충", days: 14 }, { key: "pupa", label: "번데기", days: 4 }, { key: "adult", label: "성충", days: 8 }], note: "과습한 토양·배지에서 증가합니다. 지표면 황색 끈끈이트랩으로 예찰하세요." },
-  "뿌리혹선충": { stages: [{ key: "egg", label: "알", days: 10 }, { key: "larva", label: "2령 유충", days: 12 }, { key: "nymph", label: "3·4령", days: 10 }, { key: "adult", label: "성충", days: 8 }], note: "뿌리에 혹을 만들어 흡수를 방해합니다. 연작지에서 주의하세요." },
+  "아메리카잎굴파리": { stages: [{ key: "egg", label: "알", days: 3 }, { key: "larva", label: "유충", days: 4 }, { key: "pupa", label: "번데기", days: 8 }, { key: "adult", label: "성충", days: 12 }], src: "농사로(아메리카잎굴파리)", note: "국내 이른 봄~7월 최성기, 9월부터 감소. 25℃에서 알→성충 약 14~15일. 성충이 잎에 산란하면 유충이 잎 속을 굴처럼 가해합니다." },
+  "굴파리": { stages: [{ key: "egg", label: "알", days: 3 }, { key: "larva", label: "유충", days: 4 }, { key: "pupa", label: "번데기", days: 8 }, { key: "adult", label: "성충", days: 12 }], src: "농사로(아메리카잎굴파리) 기준", note: "국내 잎굴파리류 기준. 유충이 잎 속을 가해, 성충 발생기 전후 예찰." },
+  "꽃노랑총채벌레": { stages: [{ key: "egg", label: "알", days: 3 }, { key: "larva", label: "약충", days: 7 }, { key: "pupa", label: "번데기", days: 4 }, { key: "adult", label: "성충", days: 15 }], src: "농사로(꽃노랑·대만총채벌레)", note: "국내 시설 연 10회 이상 발생. 25℃ 알 약 3일·약충 약 7일. 꽃·생장점 끈끈이트랩과 꽃 털기로 예찰." },
+  "총채벌레": { stages: [{ key: "egg", label: "알", days: 3 }, { key: "larva", label: "약충", days: 7 }, { key: "pupa", label: "번데기", days: 4 }, { key: "adult", label: "성충", days: 15 }], src: "농사로(꽃노랑·대만총채벌레) 기준", note: "국내 총채벌레류 기준. 꽃 속·어린잎을 확대 관찰." },
+  "파총채벌레": { stages: [{ key: "egg", label: "알", days: 3 }, { key: "larva", label: "약충", days: 7 }, { key: "pupa", label: "번데기", days: 4 }, { key: "adult", label: "성충", days: 15 }], src: "농사로 총채벌레류 기준", note: "국내 총채벌레류 기준 추정." },
+  "대만총채벌레": { stages: [{ key: "egg", label: "알", days: 3 }, { key: "larva", label: "약충", days: 7 }, { key: "pupa", label: "번데기", days: 4 }, { key: "adult", label: "성충", days: 15 }], src: "농사로(대만총채벌레)", note: "국내 25℃ 알 3일·약충 7일·산란전 1일, 생활사는 꽃노랑총채벌레와 유사." },
+  "점박이응애": { stages: [{ key: "egg", label: "알", days: 3 }, { key: "larva", label: "유충", days: 2 }, { key: "nymph", label: "약충", days: 4 }, { key: "adult", label: "성충", days: 14 }], src: "농사로(점박이응애)", note: "국내 고온·건조기 급증. 25℃ 알→성충 약 9일(알-유충-제1·2약충-성충). 잎 뒷면·하엽 확대 관찰." },
+  "차응애": { stages: [{ key: "egg", label: "알", days: 3 }, { key: "larva", label: "유충", days: 2 }, { key: "nymph", label: "약충", days: 4 }, { key: "adult", label: "성충", days: 14 }], src: "농사로(점박이응애) 기준", note: "국내 응애류 기준. 고온·건조에서 증가, 잎 뒷면 확대 관찰." },
+  "차먼지응애": { stages: [{ key: "egg", label: "알", days: 3 }, { key: "larva", label: "유충", days: 2 }, { key: "nymph", label: "약충", days: 4 }, { key: "adult", label: "성충", days: 12 }], src: "농사로 응애류 기준", note: "국내 응애류 기준 추정. 생장점·어린잎 기형 유발, 신초 확대 관찰." },
+  "응애": { stages: [{ key: "egg", label: "알", days: 3 }, { key: "larva", label: "유충", days: 2 }, { key: "nymph", label: "약충", days: 4 }, { key: "adult", label: "성충", days: 14 }], src: "농사로(점박이응애) 기준", note: "국내 응애류 기준. 고온·건조에서 증가, 잎 뒷면 확대 관찰." },
+  "뿌리응애": { stages: [{ key: "egg", label: "알", days: 4 }, { key: "larva", label: "유충", days: 4 }, { key: "nymph", label: "약충", days: 5 }, { key: "adult", label: "성충", days: 12 }], src: "농사로 응애류 기준", note: "국내 응애류 기준 추정. 구근·뿌리 가해, 과습·상처 회피." },
+  "목화진딧물": { stages: [{ key: "egg", label: "약충1", days: 2 }, { key: "larva", label: "약충2", days: 2 }, { key: "nymph", label: "약충3", days: 2 }, { key: "adult", label: "성충", days: 12 }], src: "농사로(목화진딧물)", note: "국내 시설 무성생식 증식, 약충 3회 탈피 후 성충까지 5~8일. 새순·잎 뒷면 확인." },
+  "복숭아혹진딧물": { stages: [{ key: "egg", label: "약충1", days: 2 }, { key: "larva", label: "약충2", days: 2 }, { key: "nymph", label: "약충3", days: 2 }, { key: "adult", label: "성충", days: 12 }], src: "농사로(목화진딧물) 기준", note: "국내 진딧물류 기준. 바이러스 매개 가능, 새순·잎 뒷면 확인." },
+  "찔레수염진딧물": { stages: [{ key: "egg", label: "약충1", days: 2 }, { key: "larva", label: "약충2", days: 2 }, { key: "nymph", label: "약충3", days: 2 }, { key: "adult", label: "성충", days: 12 }], src: "농사로 진딧물류 기준", note: "국내 진딧물류 기준 추정. 새순에 무리 짓습니다." },
+  "국화꼬마수염진딧물": { stages: [{ key: "egg", label: "약충1", days: 2 }, { key: "larva", label: "약충2", days: 2 }, { key: "nymph", label: "약충3", days: 2 }, { key: "adult", label: "성충", days: 12 }], src: "농사로 진딧물류 기준", note: "국내 진딧물류 기준 추정. 새순·꽃봉오리 확인." },
+  "진딧물": { stages: [{ key: "egg", label: "약충1", days: 2 }, { key: "larva", label: "약충2", days: 2 }, { key: "nymph", label: "약충3", days: 2 }, { key: "adult", label: "성충", days: 12 }], src: "농사로(목화진딧물) 기준", note: "국내 진딧물류 기준. 약충→성충 5~8일, 새순·잎 뒷면 확인." },
+  "온실가루이": { stages: [{ key: "egg", label: "알", days: 7 }, { key: "larva", label: "약충", days: 9 }, { key: "pupa", label: "번데기", days: 5 }, { key: "adult", label: "성충", days: 12 }], src: "농사로(온실가루이)", note: "국내 시설 알→성충 약 3~4주. 잎 뒷면에 무리, 황색 끈끈이트랩 예찰. 7~10일 간격 잎 뒷면 방제." },
+  "담배가루이": { stages: [{ key: "egg", label: "알", days: 7 }, { key: "larva", label: "약충", days: 9 }, { key: "pupa", label: "번데기", days: 5 }, { key: "adult", label: "성충", days: 12 }], src: "농사로(담배가루이)", note: "국내 시설 알→성충 약 3~4주. 바이러스 매개 가능, 잎 뒷면·황색 끈끈이트랩 확인." },
+  "가루이": { stages: [{ key: "egg", label: "알", days: 7 }, { key: "larva", label: "약충", days: 9 }, { key: "pupa", label: "번데기", days: 5 }, { key: "adult", label: "성충", days: 12 }], src: "농사로(온실·담배가루이) 기준", note: "국내 가루이류 기준. 잎 뒷면 약충과 황색 끈끈이트랩 확인." },
+  "파밤나방": { stages: [{ key: "egg", label: "알", days: 3 }, { key: "larva", label: "유충", days: 14 }, { key: "pupa", label: "번데기", days: 9 }, { key: "adult", label: "성충(나방)", days: 7 }], src: "농사로(파밤나방)", note: "국내 시설 연중·남부 6~11월(최성 9월). 알 2~5·유충 9~23·번데기 5~14일, 노지 1세대 약 24일. 어린(3령 이전) 유충기에 방제." },
+  "담배거세미나방": { stages: [{ key: "egg", label: "알", days: 4 }, { key: "larva", label: "유충", days: 16 }, { key: "pupa", label: "번데기", days: 9 }, { key: "adult", label: "성충(나방)", days: 9 }], src: "농사로 나방류(파밤나방) 기준", note: "국내 나방류 기준. 다 자란 유충은 방제가 어려우니 어린 유충기에 대응." },
+  "왕담배나방": { stages: [{ key: "egg", label: "알", days: 4 }, { key: "larva", label: "유충", days: 16 }, { key: "pupa", label: "번데기", days: 10 }, { key: "adult", label: "성충(나방)", days: 9 }], src: "농사로 나방류(파밤나방) 기준", note: "국내 나방류 기준. 꽃·봉오리 속으로 파고들어 어린 유충기에 대응." },
+  "도둑나방": { stages: [{ key: "egg", label: "알", days: 5 }, { key: "larva", label: "유충", days: 18 }, { key: "pupa", label: "번데기", days: 12 }, { key: "adult", label: "성충(나방)", days: 9 }], src: "농사로 나방류(파밤나방) 기준", note: "국내 나방류 기준. 야간 가해, 어린 유충기에 대응." },
+  "미국흰불나방": { stages: [{ key: "egg", label: "알", days: 6 }, { key: "larva", label: "유충", days: 20 }, { key: "pupa", label: "번데기", days: 12 }, { key: "adult", label: "성충(나방)", days: 8 }], src: "농사로 나방류(파밤나방) 기준", note: "국내 나방류 기준. 군서 유충이 잎을 갉아먹음." },
+  "나방류": { stages: [{ key: "egg", label: "알", days: 4 }, { key: "larva", label: "유충", days: 14 }, { key: "pupa", label: "번데기", days: 9 }, { key: "adult", label: "성충(나방)", days: 7 }], src: "농사로(파밤나방) 기준", note: "국내 나방류 기준. 어린 유충기 방제, 페로몬트랩 예찰." },
+  "작은뿌리파리": { stages: [{ key: "egg", label: "알", days: 4 }, { key: "larva", label: "유충", days: 14 }, { key: "pupa", label: "번데기", days: 4 }, { key: "adult", label: "성충", days: 8 }], src: "농사로·NCPMS(작은뿌리파리)", note: "국내 25℃ 알 4·유충 14·번데기 4일(여름철 약 15일). 과습 토양·배지에서 증가, 지표 황색 끈끈이트랩 예찰." },
+  "뿌리혹선충": { stages: [{ key: "egg", label: "알", days: 10 }, { key: "larva", label: "2령 유충", days: 12 }, { key: "nymph", label: "3·4령", days: 10 }, { key: "adult", label: "성충", days: 8 }], src: "국내 토양선충 일반(추정)", note: "국내 연작지 토양 가해. 정확한 밀도·충태는 토양검정이 필요한 추정값입니다." },
 };
-const DEFAULT_LIFECYCLE = { stages: [{ key: "egg", label: "알", days: 5 }, { key: "larva", label: "유충", days: 10 }, { key: "pupa", label: "번데기", days: 7 }, { key: "adult", label: "성충", days: 12 }], note: "일반적인 곤충 생애주기 추정값입니다. 실제 발생은 종·온도에 따라 달라집니다." };
+const DEFAULT_LIFECYCLE = { stages: [{ key: "egg", label: "알", days: 5 }, { key: "larva", label: "유충", days: 10 }, { key: "pupa", label: "번데기", days: 7 }, { key: "adult", label: "성충", days: 12 }], src: "국내 일반 추정", note: "국내 종별 발육 자료가 없어 일반 곤충 기준으로 넓게 추정한 값입니다. 실제 발생은 종·온도에 따라 다릅니다." };
 
 /* 꽃·잎에 실제 피해를 주는 단계(가해 충태). 잎굴파리·나방류·뿌리해충은 유충, 그 외(총채벌레·응애·진딧물·가루이)는 성충/약충 흡즙이 주가해 → adult 기준 */
 const PEST_DAMAGE_STAGE = {
@@ -783,7 +785,7 @@ function normalizeLifecycle(obj) {
   if (Array.isArray(obj.stages)) return obj;
   const e = Number(obj.egg), l = Number(obj.larva), p = Number(obj.pupa), a = Number(obj.adult);
   if (![e, l, p, a].every((x) => Number.isFinite(x) && x > 0)) return null;
-  return { stages: [{ key: "egg", label: "알", days: e }, { key: "larva", label: "유충", days: l }, { key: "pupa", label: "번데기", days: p }, { key: "adult", label: "성충", days: a }], note: "사용자가 추가한 꽃의 생애주기 정보입니다." };
+  return { stages: [{ key: "egg", label: "알", days: e }, { key: "larva", label: "유충", days: l }, { key: "pupa", label: "번데기", days: p }, { key: "adult", label: "성충", days: a }], src: "사용자 입력(꽃 추가)", note: "사용자가 추가한 꽃의 생애주기 정보입니다." };
 }
 
 /* 해충 1종의 오늘 충태 계산 (코어). 정식일 기준 연속 세대 추정.
@@ -831,7 +833,7 @@ function computePestStage(pestName, planting, customLcObj) {
   if (isAdultNow || (daysToAdult >= 0 && daysToAdult <= 3)) { actionLevel = "urgent"; action = "예찰·예방 방제 준비"; }
   else if (daysToAdult <= 7) { actionLevel = "soon"; action = "성충 전환 임박 · 예찰 준비"; }
   else { actionLevel = "info"; action = "관찰 유지"; }
-  return { pest: pestName, stageLabel: current.label, stageKey: current.key, stageStart, stageEnd, daysLeftInStage, stageDates, adultDate, daysToAdult, isAdultNow, damageKey, danger, actionLevel, action, note: lc.note };
+  return { pest: pestName, stageLabel: current.label, stageKey: current.key, stageStart, stageEnd, daysLeftInStage, stageDates, adultDate, daysToAdult, isAdultNow, damageKey, danger, actionLevel, action, note: lc.note, src: lc.src || "국내 일반 추정" };
 }
 
 function computePestForecast(house, profInfo) {
@@ -4710,7 +4712,8 @@ function HouseDetail({ state, update, farm, user, houseId, onBack, showToast, we
           <SectionTitle>해충 현황</SectionTitle>
           <PestGrid pests={computeAllPestStages(house, flowerProfile(house.flower))} />
           <div style={{ marginTop: 10, fontSize: 12, color: T.faint, lineHeight: 1.55 }}>
-            칸마다 벌레 이름·현재 충태·그 충태 기간을 보여줍니다. 꽃·잎에 피해가 큰(가해 단계 진행/임박) 벌레일수록 <span style={{ color: "#E0533C", fontWeight: 800 }}>진한 빨강</span>으로 표시됩니다. 심은 날짜와 저장된 생애주기로 계산한 추정값입니다.
+            칸마다 벌레 이름·현재 충태·그 충태 기간을 보여줍니다. 꽃·잎에 피해가 큰(가해 단계 진행/임박) 벌레일수록 <span style={{ color: "#E0533C", fontWeight: 800 }}>진한 빨강</span>으로 표시됩니다.
+            <br />자료: 농촌진흥청 농사로·NCPMS(국가농작물병해충관리시스템) 국내 발생자료. 발육기간은 25℃ 전후 기준이며 해외 자료는 사용하지 않습니다. 심은 날짜 기준 추정값입니다.
           </div>
         </Card>
 
@@ -4719,7 +4722,8 @@ function HouseDetail({ state, update, farm, user, houseId, onBack, showToast, we
           <SectionTitle>병(질병) 현황</SectionTitle>
           <DiseaseGrid diseases={computeDiseaseRisks(house, flowerProfile(house.flower), weather)} />
           <div style={{ marginTop: 10, fontSize: 12, color: T.faint, lineHeight: 1.55 }}>
-            칸마다 병 이름·현재 발병 위험·호발 시기(주기)를 보여줍니다. 현재 날씨(습도·온도·강수) 기준 위험이 클수록 <span style={{ color: "#E0533C", fontWeight: 800 }}>진한 빨강</span>으로 표시됩니다. 추정값이며 실제 발병은 하우스 환경에 따라 다릅니다.
+            칸마다 병 이름·현재 발병 위험·호발 시기(주기)를 보여줍니다. 현재 날씨(습도·온도·강수) 기준 위험이 클수록 <span style={{ color: "#E0533C", fontWeight: 800 }}>진한 빨강</span>으로 표시됩니다.
+            <br />자료: 병 목록은 농촌진흥청 NCPMS·농사로 국내 작목별 도감, 발병 위험은 국내 병 도감의 일반 발병환경(온·습도) 기준입니다. 해외 자료는 사용하지 않으며 실제 발병은 하우스 환경에 따라 다릅니다.
           </div>
         </Card>
 
@@ -4760,6 +4764,7 @@ function HouseDetail({ state, update, farm, user, houseId, onBack, showToast, we
                 {e.pestForecast.allPests.length > 1 && (
                   <><br /><span style={{ color: T.faint }}>그 밖의 취약 해충: {e.pestForecast.allPests.slice(1).join(", ")}</span></>
                 )}
+                <br /><span style={{ color: T.faint, fontSize: 12 }}>자료: {e.pestForecast.src} · 국내(대한민국) 발생자료 기준</span>
                 <br /><span style={{ color: T.faint, fontSize: 12 }}>※ 심은 날짜와 저장된 생애주기로 계산한 추정값입니다. 고온기에는 더 빨라질 수 있어 실제 예찰로 확인하세요.</span>
               </div>
             </>
@@ -5523,6 +5528,12 @@ function WorkLogEditModal({ log, houseName, update, onClose, showToast, onViewHo
 const FLOWER_ADD_PROMPT = `아래 JSON 형식으로 "[꽃이름]"의 시설 화훼 재배(비닐하우스) 정보를 작성해 주세요.
 반드시 JSON만, 코드블록(\`\`\`) 없이 순수 JSON으로 답해 주세요.
 수치 필드에 주석·설명 없이 숫자 값만 넣어 주세요.
+
+[근거 규칙 — 매우 중요]
+- 반드시 대한민국 국내 발생자료에 근거해 작성하세요(농촌진흥청 NCPMS 국가농작물병해충관리시스템, 농사로, 농약안전정보시스템 PSIS, 국립원예특작과학원, 국내 학술자료 등).
+- 해외 발생·해외 병해충 이슈는 넣지 마세요. 국내에서 보고된 병해충만 포함하세요.
+- 추측·창작(할루시네이션) 금지. 국내 근거를 확인하지 못한 항목은 그 칸을 비우거나 배열을 비워서 보내세요.
+- pests/diseases에는 국내 도감 표기 이름을 쓰고, pestLifecycles 일수는 국내 발육자료(대개 25℃) 기준으로만 넣으세요.
 
 {
   "name": "[꽃이름]",
