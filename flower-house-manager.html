@@ -5,8 +5,22 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
 <meta name="theme-color" content="#10130E" />
 <meta name="apple-mobile-web-app-capable" content="yes" />
+<meta name="mobile-web-app-capable" content="yes" />
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+<meta name="apple-mobile-web-app-title" content="하우스매니저" />
+<meta name="application-name" content="하우스매니저" />
 <title>화훼 하우스 매니저</title>
+<!-- 설치형 앱(PWA): 홈화면/앱 설치 + PWABuilder로 APK 생성 가능 -->
+<link rel="manifest" href="manifest.json" />
+<link rel="apple-touch-icon" href="apple-touch-icon.png" />
+<link rel="icon" type="image/png" sizes="192x192" href="icon-192.png" />
+<script>
+  if ("serviceWorker" in navigator) {
+    window.addEventListener("load", function () {
+      navigator.serviceWorker.register("sw.js").catch(function () {});
+    });
+  }
+</script>
 <link rel="preconnect" href="https://www.gstatic.com" />
 <style>
   * { -webkit-tap-highlight-color: transparent; box-sizing: border-box; }
