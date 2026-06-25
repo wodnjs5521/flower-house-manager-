@@ -774,6 +774,22 @@ function pestDamageStage(name) {
   return k ? PEST_DAMAGE_STAGE[k] : "adult";
 }
 
+/* 해충별 국내 발생 시작 시기(월동 후 첫 발생, MM-DD) — 충태 시계의 계절 기준점.
+   국내 발생자료 기반(농사로): 아메리카잎굴파리 이른 봄, 파밤나방 남부 6월상, 왕담배나방 5~6월 우화 등.
+   정식일이 아니라 '계절'을 기준으로 해, 같은 해충이면 어느 하우스든 같은 날 같은 충태로 표시된다.
+   세부 미공개 종은 분류군의 일반 발생 시작월로 근사(추정). */
+const PEST_EMERGE = {
+  "굴파리": "03-20", "총채벌레": "04-15", "응애": "04-10", "진딧물": "04-10",
+  "가루이": "04-20", "작은뿌리파리": "03-15", "뿌리혹선충": "05-01",
+  "파밤나방": "06-01", "담배거세미나방": "05-20", "왕담배나방": "05-15",
+  "도둑나방": "04-25", "미국흰불나방": "05-20", "나방": "05-15",
+};
+function pestEmerge(name) {
+  const n = String(name || "");
+  const k = Object.keys(PEST_EMERGE).sort((a, b) => b.length - a.length).find((key) => n.includes(key));
+  return k ? PEST_EMERGE[k] : "04-15";
+}
+
 function pestLifecycle(name) {
   const n = String(name || "");
   const keys = Object.keys(PEST_LIFECYCLE).sort((a, b) => b.length - a.length);
@@ -790,14 +806,18 @@ function normalizeLifecycle(obj) {
 
 /* 해충 1종의 오늘 충태 계산 (코어). 정식일 기준 연속 세대 추정.
    danger(0~1): 꽃·잎에 위협적인 정도 — 가해 단계 진행 중이거나 가해 단계로 곧 바뀌면 높음. */
-function computePestStage(pestName, planting, customLcObj) {
-  if (!planting) return null;
+function computePestStage(pestName, customLcObj) {
   const lc = normalizeLifecycle(customLcObj) || pestLifecycle(pestName);
   const stages = lc.stages;
   const total = stages.reduce((acc, s) => acc + s.days, 0);
   if (total <= 0) return null;
   const today = todayISO();
-  let daysSince = dayDiff(planting, today);
+  // 계절 기준점: 올해 발생시작일. 아직 안 됐으면 작년 발생시작일(연속 세대).
+  const emergeMMDD = lc.emerge || pestEmerge(pestName);
+  const yr = Number(today.slice(0, 4));
+  let anchor = `${yr}-${emergeMMDD}`;
+  if (dayDiff(anchor, today) < 0) anchor = `${yr - 1}-${emergeMMDD}`;
+  let daysSince = dayDiff(anchor, today);
   if (daysSince < 0) daysSince = 0;
   const gen = Math.floor(daysSince / total);
   const cycleBase = gen * total;
@@ -807,16 +827,16 @@ function computePestStage(pestName, planting, customLcObj) {
   let curIdx = stageInfos.findIndex((s) => pos >= s.startOff && pos < s.endOff);
   if (curIdx < 0) curIdx = stageInfos.length - 1;
   const current = stageInfos[curIdx];
-  const stageStart = addDaysISO(planting, cycleBase + current.startOff);
-  const stageEnd = addDaysISO(planting, cycleBase + current.endOff);
+  const stageStart = addDaysISO(anchor, cycleBase + current.startOff);
+  const stageEnd = addDaysISO(anchor, cycleBase + current.endOff);
   const daysLeftInStage = Math.max(0, dayDiff(today, stageEnd));
   const stageDates = stageInfos.map((s) => {
     const off = cycleBase + s.startOff;
-    return { key: s.key, label: s.label, date: addDaysISO(planting, off), past: off <= daysSince };
+    return { key: s.key, label: s.label, date: addDaysISO(anchor, off), past: off <= daysSince };
   });
   const adultInfo = stageInfos[stageInfos.length - 1];
-  let adultDate = addDaysISO(planting, cycleBase + adultInfo.startOff);
-  if (dayDiff(today, adultDate) < 0) adultDate = addDaysISO(planting, cycleBase + total + adultInfo.startOff);
+  let adultDate = addDaysISO(anchor, cycleBase + adultInfo.startOff);
+  if (dayDiff(today, adultDate) < 0) adultDate = addDaysISO(anchor, cycleBase + total + adultInfo.startOff);
   const daysToAdult = dayDiff(today, adultDate);
   const isAdultNow = current.key === "adult";
   const damageKey = lc.damage || pestDamageStage(pestName);
@@ -837,22 +857,18 @@ function computePestStage(pestName, planting, customLcObj) {
 }
 
 function computePestForecast(house, profInfo) {
-  const planting = plantingRoundsFor(house)[0]?.date;
-  if (!planting) return null;
   const pests = (getFlowerPrevention(profInfo.key)?.pests || []).filter(Boolean);
   if (!pests.length) return null;
   const customLcs = _activeCustomFlowers[profInfo.key]?.prevention?.pestLifecycles || {};
-  const f = computePestStage(pests[0], planting, customLcs[pests[0]]);
+  const f = computePestStage(pests[0], customLcs[pests[0]]);
   return f ? { ...f, allPests: pests } : null;
 }
 
 /* 꽃의 모든 취약 해충 충태를 계산해 위급도(danger) 높은 순으로 정렬 (해충 현황 그리드용) */
 function computeAllPestStages(house, profInfo) {
-  const planting = plantingRoundsFor(house)[0]?.date;
-  if (!planting) return [];
   const pests = (getFlowerPrevention(profInfo.key)?.pests || []).filter(Boolean);
   const customLcs = _activeCustomFlowers[profInfo.key]?.prevention?.pestLifecycles || {};
-  return pests.map((p) => computePestStage(p, planting, customLcs[p])).filter(Boolean).sort((a, b) => b.danger - a.danger);
+  return pests.map((p) => computePestStage(p, customLcs[p])).filter(Boolean).sort((a, b) => b.danger - a.danger);
 }
 
 /* ============================ 병(질병) 발병 주기/위험 ===========================
@@ -4713,7 +4729,7 @@ function HouseDetail({ state, update, farm, user, houseId, onBack, showToast, we
           <PestGrid pests={computeAllPestStages(house, flowerProfile(house.flower))} />
           <div style={{ marginTop: 10, fontSize: 12, color: T.faint, lineHeight: 1.55 }}>
             칸마다 벌레 이름·현재 충태·그 충태 기간을 보여줍니다. 꽃·잎에 피해가 큰(가해 단계 진행/임박) 벌레일수록 <span style={{ color: "#E0533C", fontWeight: 800 }}>진한 빨강</span>으로 표시됩니다.
-            <br />자료: 농촌진흥청 농사로·NCPMS(국가농작물병해충관리시스템) 국내 발생자료. 발육기간은 25℃ 전후 기준이며 해외 자료는 사용하지 않습니다. 심은 날짜 기준 추정값입니다.
+            <br />자료: 농촌진흥청 농사로·NCPMS(국가농작물병해충관리시스템) 국내 발생자료. 발육기간은 25℃ 전후, 충태는 국내 발생시기(계절) 기준이라 같은 해충이면 정식일이 달라도 모든 하우스에서 같게 표시됩니다. 해외 자료는 사용하지 않습니다.
           </div>
         </Card>
 
@@ -4765,7 +4781,7 @@ function HouseDetail({ state, update, farm, user, houseId, onBack, showToast, we
                   <><br /><span style={{ color: T.faint }}>그 밖의 취약 해충: {e.pestForecast.allPests.slice(1).join(", ")}</span></>
                 )}
                 <br /><span style={{ color: T.faint, fontSize: 12 }}>자료: {e.pestForecast.src} · 국내(대한민국) 발생자료 기준</span>
-                <br /><span style={{ color: T.faint, fontSize: 12 }}>※ 심은 날짜와 저장된 생애주기로 계산한 추정값입니다. 고온기에는 더 빨라질 수 있어 실제 예찰로 확인하세요.</span>
+                <br /><span style={{ color: T.faint, fontSize: 12 }}>※ 국내 발생시기(계절)와 저장된 생애주기로 계산한 추정값이며, 같은 해충은 정식일과 무관하게 모든 하우스에서 같게 표시됩니다. 고온기에는 더 빨라질 수 있어 실제 예찰로 확인하세요.</span>
               </div>
             </>
           ) : (
