@@ -1794,13 +1794,17 @@ function Root() {
     <div style={shell}>
       <Toast msg={toast} />
       {detailHouseId ? (
-        <HouseDetail
-          {...screenProps}
-          houseId={detailHouseId}
-          onBack={() => setDetailHouseId(null)}
-        />
+        <>
+          <BackLayer onClose={() => setDetailHouseId(null)} />
+          <HouseDetail
+            {...screenProps}
+            houseId={detailHouseId}
+            onBack={() => setDetailHouseId(null)}
+          />
+        </>
       ) : (
         <>
+          {tab !== "today" && <BackLayer onClose={() => setTab("today")} />}
           <div style={{ flex: 1, overflowY: "auto", paddingBottom: 88 }}>
             {tab === "today" && <TodayScreen {...screenProps} />}
             {tab === "quick" && <QuickScreen {...screenProps} />}
@@ -3941,7 +3945,7 @@ function MemoModal({ update, farm, houses, targetHouses, onClose, showToast }) {
     onClose();
   };
   return (
-    <Modal onClose={onClose} title="특이사항 기록">
+    <Modal onClose={onClose} title="특이사항 기록" isDirty={() => !!memo.trim()} onSave={save}>
       <Field label="내용"><textarea style={{ ...inputStyle, minHeight: 90, resize: "vertical" }} value={memo} onChange={(e) => setMemo(e.target.value)} /></Field>
       <Btn kind="primary" onClick={save} style={{ width: "100%" }}>저장</Btn>
     </Modal>
@@ -4074,17 +4078,82 @@ function HistoryCatalogModal({ selCount, onClose, onRecord }) {
   );
 }
 
-function Modal({ children, onClose, title }) {
+/* ====== 안드로이드 하드웨어 뒤로가기 → 앱 내 뒤로가기(레이어 닫기) ======
+   열린 레이어(모달·상세화면)를 history 항목과 1:1로 맞춘다. 하드웨어 뒤로가기(또는 iOS 스와이프
+   뒤로가기)가 들어오면 가장 위 레이어를 닫고, 입력 중(dirty)이면 닫기 전에 저장 확인을 띄운다.
+   레이어가 없으면 정상 뒤로가기(앱/탭 종료)로 둔다. */
+const _backLayers = [];
+let _backSuppress = false;
+if (typeof window !== "undefined" && !window.__fhmBackInit) {
+  window.__fhmBackInit = true;
+  window.addEventListener("popstate", () => {
+    if (_backSuppress) { _backSuppress = false; return; }
+    const top = _backLayers[_backLayers.length - 1];
+    if (!top) return; // 닫을 레이어 없음 → 정상 뒤로가기
+    try { window.history.pushState({ fhmLayer: true }, ""); } catch (e) {} // 소비된 항목 복구(상위 보호)
+    if (top.isDirty()) top.requestConfirm();
+    else top.close();
+  });
+}
+function useBackClose(onClose, isDirty, requestConfirm) {
+  const ref = useRef({});
+  ref.current.close = onClose;
+  ref.current.isDirty = isDirty;
+  ref.current.requestConfirm = requestConfirm;
+  useEffect(() => {
+    const layer = {
+      close: () => { if (ref.current.close) ref.current.close(); },
+      isDirty: () => !!(ref.current.isDirty && ref.current.isDirty()),
+      requestConfirm: () => { if (ref.current.requestConfirm) ref.current.requestConfirm(); },
+    };
+    _backLayers.push(layer);
+    try { window.history.pushState({ fhmLayer: true }, ""); } catch (e) {}
+    return () => {
+      const i = _backLayers.indexOf(layer);
+      if (i >= 0) _backLayers.splice(i, 1);
+      _backSuppress = true;
+      try { window.history.back(); } catch (e) {}
+      // 안전장치: popstate가 _backSuppress를 먼저 소비하므로 이 타이머는 그보다 늦게 둔다(경쟁 방지)
+      setTimeout(() => { _backSuppress = false; }, 400);
+    };
+  }, []);
+}
+/* 화면(모달 아님) 레이어용: 하드웨어 뒤로가기로 닫기. UI는 렌더하지 않음 */
+function BackLayer({ onClose }) {
+  useBackClose(onClose, () => false, () => {});
+  return null;
+}
+
+function Modal({ children, onClose, title, isDirty, onSave }) {
+  const [confirm, setConfirm] = useState(false);
+  const dirty = () => !!(isDirty && isDirty());
+  const attemptClose = () => { if (dirty()) setConfirm(true); else onClose(); };
+  useBackClose(onClose, dirty, () => setConfirm(true));
   return (
-    <div onClick={onClose} style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,.6)", zIndex: 200, display: "flex", alignItems: "flex-end", justifyContent: "center" }}>
+    <div onClick={attemptClose} style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,.6)", zIndex: 200, display: "flex", alignItems: "flex-end", justifyContent: "center" }}>
       <div onClick={(e) => e.stopPropagation()} style={{ width: "100%", maxWidth: 460, background: T.panel, borderRadius: "20px 20px 0 0", padding: "18px 18px calc(24px + env(safe-area-inset-bottom))", maxHeight: "86vh", overflowY: "auto" }}>
         <div style={{ width: 48, height: 5, background: T.line, borderRadius: 3, margin: "0 auto 14px" }} />
         <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10, marginBottom: 16 }}>
           <div style={{ fontSize: 21, fontWeight: 800, lineHeight: 1.3 }}>{title}</div>
-          <button onClick={onClose} aria-label="닫기" style={{ flexShrink: 0, width: 44, height: 44, borderRadius: 12, background: T.panel2, border: `1px solid ${T.line}`, color: T.sub, fontSize: 22, fontWeight: 800, cursor: "pointer", lineHeight: 1 }}>✕</button>
+          <button onClick={attemptClose} aria-label="닫기" style={{ flexShrink: 0, width: 44, height: 44, borderRadius: 12, background: T.panel2, border: `1px solid ${T.line}`, color: T.sub, fontSize: 22, fontWeight: 800, cursor: "pointer", lineHeight: 1 }}>✕</button>
         </div>
         {children}
       </div>
+      {confirm && (
+        <div onClick={(e) => e.stopPropagation()} style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,.55)", zIndex: 320, display: "flex", alignItems: "center", justifyContent: "center", padding: 22 }}>
+          <div style={{ width: "100%", maxWidth: 360, background: T.panel, border: `1px solid ${T.line}`, borderRadius: 18, padding: 20 }}>
+            <div style={{ fontSize: 19, fontWeight: 900, marginBottom: 8 }}>{onSave ? "저장하시겠습니까?" : "나가시겠습니까?"}</div>
+            <div style={{ fontSize: 14.5, color: T.sub, lineHeight: 1.6, marginBottom: 18 }}>
+              입력한 내용이 있습니다. 저장하지 않고 나가면 사라집니다.
+            </div>
+            <div style={{ display: "flex", flexDirection: "column", gap: 9 }}>
+              {onSave && <Btn kind="primary" onClick={() => { setConfirm(false); onSave(); }} style={{ width: "100%" }}>저장하고 나가기</Btn>}
+              <Btn kind={onSave ? "ghost" : "danger"} onClick={() => { setConfirm(false); onClose(); }} style={{ width: "100%" }}>{onSave ? "저장 안 함" : "나가기"}</Btn>
+              <Btn kind="plain" onClick={() => setConfirm(false)} style={{ width: "100%" }}>취소(계속 입력)</Btn>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
@@ -4356,7 +4425,7 @@ function HarvestModal({ house, est, update, user, farm, onClose, showToast }) {
   }
 
   return (
-    <Modal onClose={onClose} title={`${house.name} · 오늘 꽃 땄음`}>
+    <Modal onClose={onClose} title={`${house.name} · 오늘 꽃 땄음`} isDirty={() => !!amount || pct !== startPct} onSave={save}>
       {round > 1 && (
         <div style={{ background: T.ok + "1A", border: `1px solid ${T.ok}55`, borderRadius: 10, padding: "8px 12px", fontSize: 13, fontWeight: 700, color: T.ok, marginBottom: 12 }}>
           {round}차 수확 중 · 누적 {cumulative}%
@@ -5067,6 +5136,9 @@ function HouseEditModal({ house, update, onClose, showToast, farm, user, onDelet
     bedCount: house.bedCount || "",
     cellsPerBed: house.cellsPerBed || "",
   });
+  const _initRef = useRef(null);
+  useEffect(() => { if (_initRef.current === null) _initRef.current = JSON.stringify(f); }, []);
+  const isDirty = () => _initRef.current !== null && JSON.stringify(f) !== _initRef.current;
   const set = (k) => (e) => setF((x) => ({ ...x, [k]: e.target.value }));
   const setPlantingRound = (index, date) => setF((x) => ({
     ...x,
@@ -5153,7 +5225,7 @@ function HouseEditModal({ house, update, onClose, showToast, farm, user, onDelet
   const cellsN = parseInt(f.cellsPerBed) || 0;
 
   return (
-    <Modal onClose={onClose} title={`${house.name} 정보`}>
+    <Modal onClose={onClose} title={`${house.name} 정보`} isDirty={isDirty} onSave={save}>
       <Field label="하우스 이름"><input style={inputStyle} value={f.name} onChange={set("name")} /></Field>
 
       <Field label="꽃 이름 (몇 글자만 입력하면 후보가 나옵니다)">
@@ -5565,6 +5637,9 @@ function WorkLogEditModal({ log, houseName, update, onClose, showToast, onViewHo
     return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}T${p(d.getHours())}:${p(d.getMinutes())}`;
   };
   const [when, setWhen] = useState(toLocal(log.ts));
+  const _initRef = useRef(null);
+  useEffect(() => { if (_initRef.current === null) _initRef.current = JSON.stringify({ type, detail, quantity, memo, when }); }, []);
+  const isDirty = () => _initRef.current !== null && JSON.stringify({ type, detail, quantity, memo, when }) !== _initRef.current;
 
   const save = () => {
     const newTs = new Date(when).getTime() || log.ts;
@@ -5584,7 +5659,7 @@ function WorkLogEditModal({ log, houseName, update, onClose, showToast, onViewHo
   };
 
   return (
-    <Modal onClose={onClose} title={`${houseName} · 기록 수정`}>
+    <Modal onClose={onClose} title={`${houseName} · 기록 수정`} isDirty={isDirty} onSave={save}>
       <div style={{ fontSize: 13, color: T.accent, fontWeight: 700, marginBottom: 12 }}>{CAT_LABEL[log.category] || log.category}</div>
       <Field label="작업 이름"><input style={inputStyle} value={type} onChange={(e) => setType(e.target.value)} /></Field>
       <Field label="날짜·시간"><input style={{ ...inputStyle, appearance: "auto" }} type="datetime-local" value={when} onChange={(e) => setWhen(e.target.value)} /></Field>
