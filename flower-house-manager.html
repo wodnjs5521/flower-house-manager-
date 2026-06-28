@@ -611,8 +611,14 @@ async function fetchRealWeather(lat, lng) {
 
   // 앞으로 24시간 시간별 예보 구성
   const times = h.time || [];
-  // 현재 한국 시각 "YYYY-MM-DDTHH" 앞 13자리로 시작 인덱스 찾기
-  const nowStr = new Date().toLocaleString("sv", { timeZone: "Asia/Seoul" }).slice(0, 13);
+  // 한국 표준시(KST = UTC+9) 기준 현재 시각을 "YYYY-MM-DDTHH" 형식으로 구성
+  // Open-Meteo times 배열 형식: "2026-06-28T20:00" → T로 구분하므로 직접 조립
+  const _kst = new Date(new Date().toLocaleString("en-US", { timeZone: "Asia/Seoul" }));
+  const nowStr = [
+    _kst.getFullYear(),
+    String(_kst.getMonth() + 1).padStart(2, "0"),
+    String(_kst.getDate()).padStart(2, "0"),
+  ].join("-") + "T" + String(_kst.getHours()).padStart(2, "0");
   let startIdx = times.findIndex((t) => t >= nowStr);
   if (startIdx < 0) startIdx = 0;
   const next24 = Array.from({ length: 24 }, (_, i) => {

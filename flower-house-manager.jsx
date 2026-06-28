@@ -528,7 +528,13 @@ async function fetchRealWeather(lat, lng) {
 
   // 앞으로 24시간 시간별 예보 구성
   const times = h.time || [];
-  const nowStr = new Date().toLocaleString("sv", { timeZone: "Asia/Seoul" }).slice(0, 13);
+  // 한국 표준시(KST = UTC+9) 기준 "YYYY-MM-DDTHH" 형식으로 직접 조립 (sv 로케일은 공백 구분자라 T 불일치)
+  const _kst = new Date(new Date().toLocaleString("en-US", { timeZone: "Asia/Seoul" }));
+  const nowStr = [
+    _kst.getFullYear(),
+    String(_kst.getMonth() + 1).padStart(2, "0"),
+    String(_kst.getDate()).padStart(2, "0"),
+  ].join("-") + "T" + String(_kst.getHours()).padStart(2, "0");
   let startIdx = times.findIndex((t) => t >= nowStr);
   if (startIdx < 0) startIdx = 0;
   const next24 = Array.from({ length: 24 }, (_, i) => {
