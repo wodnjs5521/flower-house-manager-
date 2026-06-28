@@ -570,6 +570,19 @@ function wmoSky(code) {
   return "흐림/비 가능";
 }
 
+/* WMO 날씨 코드 → 이모지 */
+function wmoEmoji(code) {
+  if (code === 0) return "☀️";
+  if (code <= 2) return "🌤";
+  if (code === 3) return "☁️";
+  if (code >= 45 && code <= 48) return "🌫";
+  if (code >= 51 && code <= 67) return "🌧";
+  if (code >= 71 && code <= 77) return "🌨";
+  if (code >= 80 && code <= 82) return "🌦";
+  if (code >= 95) return "⛈";
+  return "🌥";
+}
+
 /* 실제 날씨 가져오기 (Open-Meteo, 인증키 불필요, 브라우저에서 직접 호출) */
 async function fetchRealWeather(lat, lng) {
   const url =
@@ -577,23 +590,44 @@ async function fetchRealWeather(lat, lng) {
     `?latitude=${lat}&longitude=${lng}` +
     "&current=temperature_2m,relative_humidity_2m,precipitation,weather_code,wind_speed_10m" +
     "&daily=temperature_2m_max,temperature_2m_min,precipitation_probability_max,weather_code" +
-    "&hourly=relative_humidity_2m,visibility" +
+    "&hourly=temperature_2m,weather_code,precipitation_probability,precipitation,relative_humidity_2m,visibility" +
     "&timezone=Asia%2FSeoul&forecast_days=2";
   const res = await fetch(url);
   if (!res.ok) throw new Error("weather fetch failed");
   const d = await res.json();
   const cur = d.current || {};
   const day = d.daily || {};
+  const h = d.hourly || {};
   const code = day.weather_code?.[0] ?? cur.weather_code ?? 3;
   // 안개 가능성: 가시거리 낮음 또는 코드 45~48
   let fog = code >= 45 && code <= 48;
   try {
-    const vis = d.hourly?.visibility || [];
+    const vis = h.visibility || [];
     const minVis = Math.min(...vis.slice(0, 12).filter((v) => typeof v === "number"));
     if (minVis < 1000) fog = true;
   } catch (e) {}
   const high = Math.round(day.temperature_2m_max?.[0] ?? cur.temperature_2m ?? 26);
   const low = Math.round(day.temperature_2m_min?.[0] ?? high - 6);
+
+  // 앞으로 24시간 시간별 예보 구성
+  const times = h.time || [];
+  // 현재 한국 시각 "YYYY-MM-DDTHH" 앞 13자리로 시작 인덱스 찾기
+  const nowStr = new Date().toLocaleString("sv", { timeZone: "Asia/Seoul" }).slice(0, 13);
+  let startIdx = times.findIndex((t) => t >= nowStr);
+  if (startIdx < 0) startIdx = 0;
+  const next24 = Array.from({ length: 24 }, (_, i) => {
+    const idx = startIdx + i;
+    if (idx >= times.length) return null;
+    const t = times[idx]; // "YYYY-MM-DDTHH:00"
+    return {
+      label: i === 0 ? "지금" : `${String(Number(t.slice(11, 13)))}시`,
+      temp: Math.round(h.temperature_2m?.[idx] ?? 0),
+      emoji: wmoEmoji(h.weather_code?.[idx] ?? 0),
+      rainProb: Math.round(h.precipitation_probability?.[idx] ?? 0),
+      rain: Number(h.precipitation?.[idx]) || 0,
+    };
+  }).filter(Boolean);
+
   return {
     cur: Math.round(cur.temperature_2m ?? (high + low) / 2),
     high,
@@ -608,6 +642,7 @@ async function fetchRealWeather(lat, lng) {
     tomorrowHigh: Math.round(day.temperature_2m_max?.[1] ?? high),
     tomorrowLow: Math.round(day.temperature_2m_min?.[1] ?? low),
     tomorrowSky: wmoSky(day.weather_code?.[1] ?? code),
+    next24,
     source: "live",
     fetchedAt: Date.now(),
   };
@@ -2407,6 +2442,32 @@ function TodayScreen({ state, farm, setTab, setDetailHouseId, update, weather, w
               <div>{weather.fog ? "🌫 안개 가능" : weather.heatRisk ? "🔥 고온 주의" : "양호"}</div>
             </div>
           </div>
+          {/* 시간별 24시간 예보 스트립 */}
+          {weather.source === "live" && weather.next24 && weather.next24.length > 0 && (
+            <div style={{ marginTop: 12, paddingTop: 10, borderTop: `1px solid ${T.line}` }}>
+              <div style={{ fontSize: 12, color: T.faint, marginBottom: 6, fontWeight: 700 }}>시간별 날씨 (24시간)</div>
+              <div style={{
+                display: "flex", gap: 6, overflowX: "auto", paddingBottom: 4,
+                scrollbarWidth: "none", WebkitOverflowScrolling: "touch",
+              }}>
+                {weather.next24.map((h, i) => (
+                  <div key={i} style={{
+                    minWidth: 52, flexShrink: 0, textAlign: "center",
+                    background: i === 0 ? T.accent + "22" : T.bg2 || T.line + "44",
+                    border: i === 0 ? `1.5px solid ${T.accent}` : `1px solid ${T.line}`,
+                    borderRadius: 10, padding: "6px 4px",
+                  }}>
+                    <div style={{ fontSize: 11, color: i === 0 ? T.accent : T.faint, fontWeight: i === 0 ? 800 : 600, marginBottom: 2 }}>{h.label}</div>
+                    <div style={{ fontSize: 17 }}>{h.emoji}</div>
+                    <div style={{ fontSize: 13, fontWeight: 800, marginTop: 2 }}>{h.temp}°</div>
+                    {h.rainProb >= 20 && (
+                      <div style={{ fontSize: 10, color: "#5B9BD5", fontWeight: 700, marginTop: 1 }}>{h.rainProb}%</div>
+                    )}
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
           {weather.source === "live" && weather.tomorrowHigh != null && (
             <div style={{ marginTop: 10, paddingTop: 10, borderTop: `1px solid ${T.line}`, fontSize: 13, color: T.sub }}>
               내일: {weather.tomorrowSky} · 최고 {weather.tomorrowHigh}℃ / 최저 {weather.tomorrowLow}℃
