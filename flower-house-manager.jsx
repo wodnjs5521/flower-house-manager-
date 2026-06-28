@@ -55,6 +55,9 @@ const TASK_LEVELS = {
   info: { label: "참고", color: "#7C8A6E" },
 };
 
+/* WeatherAPI.com 인증키 */
+const WEATHER_API_KEY = "9b9308602dad4136bec111346262806";
+
 /* ----------------------------- 유틸 ------------------------------------- */
 const uid = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
 const localISODate = (value = Date.now()) => {
@@ -487,89 +490,94 @@ function wmoSky(code) {
   return "흐림/비 가능";
 }
 
-/* WMO 날씨 코드 → 이모지 */
-function wmoEmoji(code) {
-  if (code === 0) return "☀️";
-  if (code <= 2) return "🌤";
-  if (code === 3) return "☁️";
-  if (code >= 45 && code <= 48) return "🌫";
-  if (code >= 51 && code <= 67) return "🌧";
-  if (code >= 71 && code <= 77) return "🌨";
-  if (code >= 80 && code <= 82) return "🌦";
-  if (code >= 95) return "⛈";
+/* WeatherAPI.com 날씨 코드 → 한국어 하늘 상태 */
+function wapiSky(code) {
+  if (code === 1000) return "맑음";
+  if (code === 1003) return "구름 조금";
+  if (code === 1006 || code === 1009) return "흐림";
+  if (code === 1030 || code === 1135 || code === 1147) return "안개";
+  if (code === 1087 || code >= 1273) return "뇌우";
+  if (code === 1114 || code === 1117) return "눈보라";
+  if ((code >= 1150 && code <= 1201) || (code >= 1240 && code <= 1246)) return "비/이슬비";
+  if ((code >= 1204 && code <= 1237) || (code >= 1249 && code <= 1264)) return "눈/눈비";
+  if (code >= 1063 && code <= 1072) return "비 가능";
+  return "흐림";
+}
+
+/* WeatherAPI.com 날씨 코드 → 이모지 */
+function wapiEmoji(code) {
+  if (code === 1000) return "☀️";
+  if (code === 1003) return "🌤";
+  if (code === 1006 || code === 1009) return "☁️";
+  if (code === 1030 || code === 1135 || code === 1147) return "🌫";
+  if (code === 1087 || code >= 1273) return "⛈";
+  if (code === 1114 || code === 1117) return "🌨";
+  if ((code >= 1150 && code <= 1201) || (code >= 1240 && code <= 1246)) return "🌧";
+  if ((code >= 1204 && code <= 1237) || (code >= 1249 && code <= 1264)) return "🌨";
+  if (code >= 1063 && code <= 1072) return "🌦";
   return "🌥";
 }
 
-/* 실제 날씨 가져오기 (Open-Meteo, 인증키 불필요, 브라우저에서 직접 호출) */
+/* 실제 날씨 가져오기 (WeatherAPI.com — 한국 기상 모델 기반, CORS 허용) */
 async function fetchRealWeather(lat, lng) {
   const url =
-    "https://api.open-meteo.com/v1/forecast" +
-    `?latitude=${lat}&longitude=${lng}` +
-    "&current=temperature_2m,relative_humidity_2m,precipitation,weather_code,wind_speed_10m" +
-    "&daily=temperature_2m_max,temperature_2m_min,precipitation_probability_max,weather_code" +
-    "&hourly=temperature_2m,weather_code,precipitation_probability,precipitation,relative_humidity_2m,visibility" +
-    "&timezone=Asia%2FSeoul&forecast_days=2";
+    "https://api.weatherapi.com/v1/forecast.json" +
+    `?key=${WEATHER_API_KEY}&q=${lat},${lng}&days=2&aqi=no&alerts=no&lang=ko`;
   const res = await fetch(url);
   if (!res.ok) throw new Error("weather fetch failed");
   const d = await res.json();
+
   const cur = d.current || {};
-  const day = d.daily || {};
-  const h = d.hourly || {};
+  const f0 = d.forecast?.forecastday?.[0] || {};
+  const f1 = d.forecast?.forecastday?.[1] || {};
+
+  const curCode = cur.condition?.code ?? 1003;
+  const fog = curCode === 1030 || curCode === 1135 || curCode === 1147;
+  const high = Math.round(f0.day?.maxtemp_c ?? cur.temp_c ?? 26);
+  const low = Math.round(f0.day?.mintemp_c ?? high - 6);
 
   // KST 현재 시각 → hourly 시작 인덱스
-  const times = h.time || [];
+  // WeatherAPI 시간 형식: "2026-06-28 20:00" (공백 구분)
+  const allHours = [...(f0.hour || []), ...(f1.hour || [])];
   const _kst = new Date(new Date().toLocaleString("en-US", { timeZone: "Asia/Seoul" }));
-  const nowStr = [
+  const curHourStr = [
     _kst.getFullYear(),
     String(_kst.getMonth() + 1).padStart(2, "0"),
     String(_kst.getDate()).padStart(2, "0"),
-  ].join("-") + "T" + String(_kst.getHours()).padStart(2, "0");
-  let startIdx = times.findIndex((t) => t >= nowStr);
+  ].join("-") + " " + String(_kst.getHours()).padStart(2, "0") + ":00";
+  let startIdx = allHours.findIndex((h) => h.time >= curHourStr);
   if (startIdx < 0) startIdx = 0;
 
-  // 현재 하늘 상태: current 관측값 우선, 없으면 hourly 현재 시각, 없으면 daily
-  const curCode = cur.weather_code ?? h.weather_code?.[startIdx] ?? day.weather_code?.[0] ?? 3;
-  // 안개 가능성: 가시거리 낮음 또는 코드 45~48
-  let fog = curCode >= 45 && curCode <= 48;
-  try {
-    const vis = h.visibility || [];
-    const minVis = Math.min(...vis.slice(startIdx, startIdx + 3).filter((v) => typeof v === "number"));
-    if (minVis < 1000) fog = true;
-  } catch (e) {}
-  const high = Math.round(day.temperature_2m_max?.[0] ?? cur.temperature_2m ?? 26);
-  const low = Math.round(day.temperature_2m_min?.[0] ?? high - 6);
+  const curRainProb = Math.round(allHours[startIdx]?.chance_of_rain ?? f0.day?.daily_chance_of_rain ?? 0);
 
-  // 강수확률: 현재 시각 hourly 값 사용 (daily max는 하루 중 최고라 밤에도 낮 수치가 남음)
-  const curRainProb = Math.round(h.precipitation_probability?.[startIdx] ?? day.precipitation_probability_max?.[0] ?? 0);
-
-  // 앞으로 24시간 시간별 예보
+  // 앞으로 24시간 시간별 예보 구성
   const next24 = Array.from({ length: 24 }, (_, i) => {
-    const idx = startIdx + i;
-    if (idx >= times.length) return null;
-    const t = times[idx];
+    const h = allHours[startIdx + i];
+    if (!h) return null;
+    const hCode = h.condition?.code ?? 1003;
     return {
-      label: i === 0 ? "지금" : `${String(Number(t.slice(11, 13)))}시`,
-      temp: Math.round(h.temperature_2m?.[idx] ?? 0),
-      emoji: wmoEmoji(h.weather_code?.[idx] ?? 0),
-      rainProb: Math.round(h.precipitation_probability?.[idx] ?? 0),
-      rain: Number(h.precipitation?.[idx]) || 0,
+      label: i === 0 ? "지금" : `${Number(h.time.slice(11, 13))}시`,
+      temp: Math.round(h.temp_c ?? 0),
+      emoji: wapiEmoji(hCode),
+      rainProb: Math.round(h.chance_of_rain ?? 0),
+      rain: Number(h.precip_mm) || 0,
     };
   }).filter(Boolean);
 
   return {
-    cur: Math.round(cur.temperature_2m ?? (high + low) / 2),
+    cur: Math.round(cur.temp_c ?? (high + low) / 2),
     high,
     low,
-    humidity: Math.round(cur.relative_humidity_2m ?? 60),
-    rain: Number(cur.precipitation) || 0,
+    humidity: Math.round(cur.humidity ?? 60),
+    rain: Number(cur.precip_mm) || 0,
     rainProb: curRainProb,
-    wind: Math.round((cur.wind_speed_10m ?? 0)),
+    wind: Math.round(cur.wind_kph ?? 0),
     fog,
-    sky: wmoSky(curCode),
+    sky: wapiSky(curCode),
     heatRisk: high >= 32,
-    tomorrowHigh: Math.round(day.temperature_2m_max?.[1] ?? high),
-    tomorrowLow: Math.round(day.temperature_2m_min?.[1] ?? low),
-    tomorrowSky: wmoSky(day.weather_code?.[1] ?? code),
+    tomorrowHigh: Math.round(f1.day?.maxtemp_c ?? high),
+    tomorrowLow: Math.round(f1.day?.mintemp_c ?? low),
+    tomorrowSky: wapiSky(f1.day?.condition?.code ?? curCode),
     next24,
     source: "live",
     fetchedAt: Date.now(),
