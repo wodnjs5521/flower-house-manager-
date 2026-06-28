@@ -515,20 +515,9 @@ async function fetchRealWeather(lat, lng) {
   const cur = d.current || {};
   const day = d.daily || {};
   const h = d.hourly || {};
-  const code = day.weather_code?.[0] ?? cur.weather_code ?? 3;
-  // 안개 가능성: 가시거리 낮음 또는 코드 45~48
-  let fog = code >= 45 && code <= 48;
-  try {
-    const vis = h.visibility || [];
-    const minVis = Math.min(...vis.slice(0, 12).filter((v) => typeof v === "number"));
-    if (minVis < 1000) fog = true;
-  } catch (e) {}
-  const high = Math.round(day.temperature_2m_max?.[0] ?? cur.temperature_2m ?? 26);
-  const low = Math.round(day.temperature_2m_min?.[0] ?? high - 6);
 
-  // 앞으로 24시간 시간별 예보 구성
+  // KST 현재 시각 → hourly 시작 인덱스
   const times = h.time || [];
-  // 한국 표준시(KST = UTC+9) 기준 "YYYY-MM-DDTHH" 형식으로 직접 조립 (sv 로케일은 공백 구분자라 T 불일치)
   const _kst = new Date(new Date().toLocaleString("en-US", { timeZone: "Asia/Seoul" }));
   const nowStr = [
     _kst.getFullYear(),
@@ -537,6 +526,23 @@ async function fetchRealWeather(lat, lng) {
   ].join("-") + "T" + String(_kst.getHours()).padStart(2, "0");
   let startIdx = times.findIndex((t) => t >= nowStr);
   if (startIdx < 0) startIdx = 0;
+
+  // 현재 하늘 상태: current 관측값 우선, 없으면 hourly 현재 시각, 없으면 daily
+  const curCode = cur.weather_code ?? h.weather_code?.[startIdx] ?? day.weather_code?.[0] ?? 3;
+  // 안개 가능성: 가시거리 낮음 또는 코드 45~48
+  let fog = curCode >= 45 && curCode <= 48;
+  try {
+    const vis = h.visibility || [];
+    const minVis = Math.min(...vis.slice(startIdx, startIdx + 3).filter((v) => typeof v === "number"));
+    if (minVis < 1000) fog = true;
+  } catch (e) {}
+  const high = Math.round(day.temperature_2m_max?.[0] ?? cur.temperature_2m ?? 26);
+  const low = Math.round(day.temperature_2m_min?.[0] ?? high - 6);
+
+  // 강수확률: 현재 시각 hourly 값 사용 (daily max는 하루 중 최고라 밤에도 낮 수치가 남음)
+  const curRainProb = Math.round(h.precipitation_probability?.[startIdx] ?? day.precipitation_probability_max?.[0] ?? 0);
+
+  // 앞으로 24시간 시간별 예보
   const next24 = Array.from({ length: 24 }, (_, i) => {
     const idx = startIdx + i;
     if (idx >= times.length) return null;
@@ -556,10 +562,10 @@ async function fetchRealWeather(lat, lng) {
     low,
     humidity: Math.round(cur.relative_humidity_2m ?? 60),
     rain: Number(cur.precipitation) || 0,
-    rainProb: Math.round(day.precipitation_probability_max?.[0] ?? 0),
+    rainProb: curRainProb,
     wind: Math.round((cur.wind_speed_10m ?? 0)),
     fog,
-    sky: wmoSky(code),
+    sky: wmoSky(curCode),
     heatRisk: high >= 32,
     tomorrowHigh: Math.round(day.temperature_2m_max?.[1] ?? high),
     tomorrowLow: Math.round(day.temperature_2m_min?.[1] ?? low),
