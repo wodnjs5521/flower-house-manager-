@@ -16,8 +16,27 @@
 <link rel="icon" type="image/png" sizes="192x192" href="icon-192.png" />
 <script>
   if ("serviceWorker" in navigator) {
+    /* ── 자동 업데이트: 새 서비스워커가 활성화되면 앱을 자동 재로딩 ──
+       흐름: 코드 배포 → 브라우저가 sw.js 바이트 변경 감지 → 새 SW 설치/활성화
+             → controllerchange 이벤트 → 배너 1초 → 자동 새로고침 → 최신 버전 적용  */
+    var _swHadController = !!navigator.serviceWorker.controller; // 첫 설치 때는 false
+    var _swRefreshing = false;
+    navigator.serviceWorker.addEventListener("controllerchange", function () {
+      if (_swHadController && !_swRefreshing) {
+        _swRefreshing = true;
+        // 업데이트 완료 배너 (React 렌더 전에 표시되도록 순수 DOM)
+        var b = document.createElement("div");
+        b.textContent = "✅ 앱 새 버전 적용 중…";
+        b.style.cssText = "position:fixed;top:0;left:0;right:0;z-index:99999;background:#2A7A3F;color:#fff;text-align:center;padding:15px 12px;font-size:15px;font-weight:700;font-family:sans-serif;letter-spacing:-.2px;";
+        if (document.body) document.body.appendChild(b);
+        setTimeout(function () { window.location.reload(); }, 1200);
+      }
+    });
     window.addEventListener("load", function () {
-      navigator.serviceWorker.register("sw.js").catch(function () {});
+      navigator.serviceWorker.register("sw.js").then(function (reg) {
+        // 30분마다 새 배포 체크 (앱이 오래 열려 있을 때도 업데이트 감지)
+        setInterval(function () { reg.update(); }, 30 * 60 * 1000);
+      }).catch(function () {});
     });
   }
 </script>
